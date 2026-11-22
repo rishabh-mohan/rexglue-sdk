@@ -563,6 +563,18 @@ std::string FunctionNode::emitCppForEntry(const EmitContext& ctx,
   bool allRecompiled = true;
   CSRState csrState = CSRState::Unknown;
   RecompilerLocalVariables localVariables;
+  // An interior body entry and its partners keep every register in ctx.
+  const bool registersInCtx = ctx.registersInCtx &&
+                              ctx.registersInCtx->contains(static_cast<uint32_t>(entry.base()));
+  // cr_compare_so_zero: this body writes no XER.SO, and its XER is a local
+  // (zero-initialized) or no body that keeps XER in ctx writes XER.SO.
+  const bool compareSoZero =
+      ctx.xerWriters && !ctx.xerWriters->contains(static_cast<uint32_t>(entry.base())) &&
+      ((ctx.config.xerAsLocalVariable && !registersInCtx) || !ctx.ctxXerWritten);
+  // skip_lr: this body uses LR as data (blrl, or bl to a local label), so it
+  // keeps LR.
+  const bool keepLr =
+      ctx.lrUsers && ctx.lrUsers->contains(static_cast<uint32_t>(entry.base()));
 
   // Local map for late-detected jump tables (can't mutate const config)
   std::unordered_map<uint32_t, JumpTable> lateJumpTables;
@@ -660,8 +672,9 @@ std::string FunctionNode::emitCppForEntry(const EmitContext& ctx,
 
         // Dispatch instruction to builder
         int id = insn.opcode->id;
-        BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
-                                  localVariables, csrState, activeJt};
+        BuilderContext builderCtx{body,           ctx,      *this,    insn,           blockBase,
+                                  data,           localVariables, csrState, activeJt,
+                                  registersInCtx, compareSoZero,  keepLr};
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();

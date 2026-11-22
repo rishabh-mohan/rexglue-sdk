@@ -60,7 +60,7 @@ constexpr T round_up(T value, V multiple, bool force_non_zero = true) {
 // explicitly defined.
 template <typename T>
 T clamp_float(T value, T min_value, T max_value) {
-  float clamped_to_min = std::isgreater(value, min_value) ? value : min_value;
+  T clamped_to_min = std::isgreater(value, min_value) ? value : min_value;
   return std::isless(clamped_to_min, max_value) ? clamped_to_min : max_value;
 }
 
@@ -187,7 +187,9 @@ inline T log2_ceil(T v) {
 
 template <typename T>
 inline T rotate_left(T v, uint8_t sh) {
-  return (T(v) << sh) | (T(v) >> ((sizeof(T) * 8) - sh));
+  // Mask both counts: a shift by the full width (sh == 0, or sh >= width) is UB.
+  sh = uint8_t(sh & (sizeof(T) * 8 - 1));
+  return (T(v) << sh) | (T(v) >> ((sizeof(T) * 8 - sh) & (sizeof(T) * 8 - 1)));
 }
 
 #if REX_ARCH_AMD64

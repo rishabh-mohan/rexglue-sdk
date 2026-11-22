@@ -17,8 +17,14 @@
 #include <chrono>
 #include <memory>
 #include <vector>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <immintrin.h>
+#else
+#include <thread>
+#endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -38,6 +44,13 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_BOOL(
+    spinlock_pause_spin, false, "Kernel",
+    "Guest kernel spinlocks (KfAcquireSpinLock, KeAcquireSpinLockAtRaisedIrql, and the kernel's "
+    "own APC and reader/writer-lock spinlocks) wait in a CPU pause loop that retries only when "
+    "the lock reads free, and yield the thread only after 10 us of waiting. false restores the "
+    "original behaviour: SwitchToThread after every failed attempt.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -962,6 +975,44 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   pcr->current_irql = new_irql;
 }
 
+namespace {
+inline void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
+// spinlock_pause_spin: how long a waiter pauses before each MaybeYield.
+constexpr std::chrono::nanoseconds kSpinLockYieldAfter{10000};
+
+// spinlock_pause_spin: test-and-test-and-set acquire. One CAS; after a failure,
+// a CPU pause and a plain read until the lock reads free, then the CAS again.
+// MaybeYield (SwitchToThread) only after kSpinLockYieldAfter of pausing
+// (steady_clock, checked every 32 pauses), then again after each further
+// kSpinLockYieldAfter.
+void AcquireSpinLockPauseSpin(volatile uint32_t* owner, uint32_t self) {
+  if (rex::thread::atomic_cas(0u, self, owner)) {
+    return;
+  }
+  auto yield_deadline = std::chrono::steady_clock::now() + kSpinLockYieldAfter;
+  for (;;) {
+    uint32_t pauses = 0;
+    do {
+      CpuRelax();
+      if (!(++pauses & 31) && std::chrono::steady_clock::now() >= yield_deadline) {
+        rex::thread::MaybeYield();
+        yield_deadline = std::chrono::steady_clock::now() + kSpinLockYieldAfter;
+      }
+    } while (*owner != 0);
+    if (rex::thread::atomic_cas(0u, self, owner)) {
+      return;
+    }
+  }
+}
+}  // namespace
+
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
@@ -969,6 +1020,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
   assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  if (REXCVAR_GET(spinlock_pause_spin)) {
+    AcquireSpinLockPauseSpin(&lock->prcb_of_owner.value, self);
+    return old_irql;
+  }
   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
     rex::thread::MaybeYield();
   }

@@ -3,6 +3,35 @@
 # Provides ppc_add_test_binary() for assembling, linking, and generating
 # symbol maps from PPC assembly test files.
 
+# Script mode, used by the symbol-map rule in ppc_add_test_binary():
+#   cmake -DPPC_NM=<nm> -DPPC_NM_INPUT=<obj> -DPPC_NM_OUTPUT=<map> -P ppc_test_pipeline.cmake
+# Runs nm with its stdout on a pipe and writes the captured bytes to <map> unchanged. The bundled
+# Cygwin powerpc-none-elf-nm.exe crashes (0xC0000005) when its stdout is redirected to a file.
+# file(WRITE) opens its output in text mode, which turns every LF into CRLF on Windows, so the map is
+# written with file(CONFIGURE ... NEWLINE_STYLE LF) (binary mode, LF). With @ONLY, file(CONFIGURE)
+# changes only @VAR@ references and #cmakedefine lines; nm output has neither, and the check below
+# fails the step rather than write a map that could differ from nm's output.
+if(CMAKE_SCRIPT_MODE_FILE AND DEFINED PPC_NM_OUTPUT)
+    execute_process(
+        COMMAND "${PPC_NM}" --numeric-sort "${PPC_NM_INPUT}"
+        OUTPUT_VARIABLE _ppc_nm_output
+        RESULT_VARIABLE _ppc_nm_result
+    )
+    if(NOT _ppc_nm_result STREQUAL "0")
+        message(FATAL_ERROR "${PPC_NM} --numeric-sort ${PPC_NM_INPUT} failed: ${_ppc_nm_result}")
+    endif()
+    if(_ppc_nm_output MATCHES "@|#cmakedefine")
+        message(FATAL_ERROR "nm output for ${PPC_NM_INPUT} contains '@' or '#cmakedefine'; not written")
+    endif()
+    file(REMOVE "${PPC_NM_OUTPUT}")
+    if(_ppc_nm_output STREQUAL "")
+        file(WRITE "${PPC_NM_OUTPUT}" "")
+    else()
+        file(CONFIGURE OUTPUT "${PPC_NM_OUTPUT}" CONTENT "${_ppc_nm_output}" @ONLY NEWLINE_STYLE LF)
+    endif()
+    return()
+endif()
+
 # Locate PPC toolchain in tools/ directory
 set(PPC_TOOLS_DIR "${PROJECT_SOURCE_DIR}/tools/binutils")
 
@@ -82,11 +111,16 @@ function(ppc_add_test_binary ASM_FILE OBJ_DIR BIN_DIR)
         VERBATIM
     )
 
-    # Generate symbol map
+    # Generate symbol map. nm runs under cmake -P (script mode, top of this file) so that its
+    # stdout is a pipe rather than a file; see the note there.
     add_custom_command(
         OUTPUT ${MAP_FILE}
-        COMMAND ${PPC_NM} --numeric-sort ${OBJ_FILE_CYGWIN} > ${MAP_FILE}
-        DEPENDS ${OBJ_FILE}
+        COMMAND ${CMAKE_COMMAND}
+                -DPPC_NM=${PPC_NM}
+                -DPPC_NM_INPUT=${OBJ_FILE_CYGWIN}
+                -DPPC_NM_OUTPUT=${MAP_FILE}
+                -P ${CMAKE_CURRENT_FUNCTION_LIST_FILE}
+        DEPENDS ${OBJ_FILE} ${CMAKE_CURRENT_FUNCTION_LIST_FILE}
         COMMENT "Generating symbol map for ${BASE_NAME}"
         VERBATIM
     )

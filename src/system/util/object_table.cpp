@@ -10,17 +10,120 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/util/object_table.h>
 #include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
 
+// Agent 11 (task #10, item 7): see perf-notes/agent11-global-mutex-design.md.
+REXCVAR_DEFINE_BOOL(object_lookup_fast_path, false, "Kernel",
+                    "Experimental: handle lookups (and the already-initialized path of "
+                    "XObject::GetNativeObject) take a reader-writer lock on the handle table "
+                    "instead of the global critical region. Writers still take the global "
+                    "critical region. Also turns on guest_suspend_guard. Read once at startup");
+
 namespace rex::system::util {
 
-ObjectTable::ObjectTable() {}
+namespace {
+
+// Lock "T" from the design doc. It protects only the table memory
+// (table_, table_capacity_, last_free_entry_ and every entry.object) when the
+// fast path is on. Lock order: G (global critical region) -> T -> name_mutex_.
+// Rules (perf-notes/agent12-gcr-review.md):
+//  - T shared is a leaf. A fast lookup holds it only for the slot read and the
+//    Retain, never acquires it twice and takes no other lock under it. SRW is
+//    not re-entrant: a recursive shared acquire deadlocks once a writer queues
+//    between the two acquires (Agent 12's bench S1).
+//  - Never take G, or U (XFile::unlocked_read_lock_), while holding T in
+//    either mode.
+// std::shared_mutex is an SRW lock on MSVC: trivially destructible, so it is
+// safe even if ObjectTable is destroyed during static destruction.
+std::shared_mutex table_lock_;
+
+// Latched once, before any guest thread exists (ObjectTable is constructed with
+// KernelState). Readers and writers test the same value, so they always agree.
+std::atomic<bool> fast_path_enabled_{false};
+
+// SRW is not recursive. This makes writer sections re-entrant (Restore ->
+// Resize, AddHandle -> FindFreeSlot -> Resize) and sends any lookup made while
+// this thread holds T exclusive down the old G path. Invariant: a section
+// that holds T without G (only Restore and RestoreHandle) must not look up
+// objects, since that would take G after T (lock order is G -> T).
+thread_local uint32_t table_write_depth_ = 0;
+
+inline bool FastPathEnabled() {
+  return fast_path_enabled_.load(std::memory_order_acquire);
+}
+
+void LockTableExclusive() {
+  if (table_write_depth_++ == 0) {
+    table_lock_.lock();
+  }
+}
+
+void UnlockTableExclusive() {
+  if (--table_write_depth_ == 0) {
+    table_lock_.unlock();
+  }
+}
+
+// Takes T exclusive only when the fast path is on. With it off this is a no-op
+// and the surrounding code is exactly the old code.
+class TableWriteLock {
+ public:
+  TableWriteLock() : locked_(FastPathEnabled()) {
+    if (locked_) {
+      LockTableExclusive();
+    }
+  }
+  ~TableWriteLock() {
+    if (locked_) {
+      UnlockTableExclusive();
+    }
+  }
+  TableWriteLock(const TableWriteLock&) = delete;
+  TableWriteLock& operator=(const TableWriteLock&) = delete;
+
+ private:
+  bool locked_;
+};
+
+}  // namespace
+
+// Used by xobject.cpp (GetNativeObject fast path) and xthread.cpp (suspend guard).
+bool ObjectLookupFastPathEnabled() {
+  return FastPathEnabled();
+}
+
+// XThread::Suspend (guarded path) holds G and then T exclusive across
+// SuspendThread + GetThreadContext, so the target never stops while it holds T
+// shared. No-ops when the fast path is off.
+void LockObjectTableForSuspend() {
+  if (FastPathEnabled()) {
+    LockTableExclusive();
+  }
+}
+
+void UnlockObjectTableForSuspend() {
+  if (FastPathEnabled()) {
+    UnlockTableExclusive();
+  }
+}
+
+ObjectTable::ObjectTable() {
+  // Latched for the whole process: a second table (if one is ever made) must
+  // not flip the flag while another table is in use.
+  static const bool fast_path = REXCVAR_GET(object_lookup_fast_path);
+  fast_path_enabled_.store(fast_path, std::memory_order_release);
+}
 
 ObjectTable::~ObjectTable() {
   Reset();
@@ -28,6 +131,29 @@ ObjectTable::~ObjectTable() {
 
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
+
+  if (FastPathEnabled()) {
+    // Detach the table under T, then release outside T: no destructor runs
+    // while T is held.
+    ObjectTableEntry* old_table = nullptr;
+    uint32_t old_capacity = 0;
+    {
+      TableWriteLock table_lock;
+      old_table = table_;
+      old_capacity = table_capacity_;
+      table_ = nullptr;
+      table_capacity_ = 0;
+      last_free_entry_ = 0;
+    }
+    for (uint32_t n = 0; n < old_capacity; n++) {
+      ObjectTableEntry& entry = old_table[n];
+      if (entry.object) {
+        entry.object->Release();
+      }
+    }
+    free(old_table);
+    return;
+  }
 
   // Release all objects.
   for (uint32_t n = 0; n < table_capacity_; n++) {
@@ -76,6 +202,9 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
 }
 
 bool ObjectTable::Resize(uint32_t new_capacity) {
+  // realloc may free the old array: no fast reader may be inside it.
+  TableWriteLock table_lock;
+
   uint32_t new_size = new_capacity * sizeof(ObjectTableEntry);
   uint32_t old_size = table_capacity_ * sizeof(ObjectTableEntry);
   auto new_table = reinterpret_cast<ObjectTableEntry*>(realloc(table_, new_size));
@@ -101,6 +230,9 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   uint32_t handle = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
+    // The Retain below happens inside the same T section that publishes the
+    // entry, so a fast reader never sees an entry whose table ref is missing.
+    TableWriteLock table_lock;
 
     // Find a free slot.
     uint32_t slot = 0;
@@ -183,15 +315,22 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
+  // Take G before LookupTable, not after it: Resize can realloc the table, so
+  // the entry pointer is only valid while G is held (part A of the design;
+  // reviewed by Agent 12). No new lock order: LookupTable takes G itself.
+  auto global_lock = global_critical_region_.Acquire();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
-    entry->object = nullptr;
+    {
+      // Unpublish under T; everything else (including Release) stays under G only.
+      TableWriteLock table_lock;
+      entry->object = nullptr;
+    }
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
 
@@ -231,6 +370,27 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
 
 void ObjectTable::PurgeAllObjects() {
   auto lock = global_critical_region_.Acquire();
+
+  if (FastPathEnabled()) {
+    // Unpublish under T, release outside T.
+    std::vector<XObject*> purged;
+    {
+      TableWriteLock table_lock;
+      for (uint32_t slot = 0; slot < table_capacity_; slot++) {
+        auto& entry = table_[slot];
+        if (entry.object && !entry.object->is_host_object()) {
+          entry.handle_ref_count = 0;
+          purged.push_back(entry.object);
+          entry.object = nullptr;
+        }
+      }
+    }
+    for (XObject* object : purged) {
+      object->Release();
+    }
+    return;
+  }
+
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
     auto& entry = table_[slot];
     if (entry.object && !entry.object->is_host_object()) {
@@ -271,6 +431,21 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   handle = TranslateHandle(handle);
   if (!handle) {
     return nullptr;
+  }
+
+  if (!already_locked && FastPathEnabled() && table_write_depth_ == 0) {
+    // Fast path: T shared, no G. Only the slot read and one atomic increment
+    // happen under T (see the memory-model argument in the design doc).
+    XObject* object = nullptr;
+    std::shared_lock<std::shared_mutex> table_lock(table_lock_);
+    uint32_t slot = GetHandleSlot(handle);
+    if (slot < table_capacity_) {
+      object = table_[slot].object;
+      if (object) {
+        object->Retain();
+      }
+    }
+    return object;
   }
 
   XObject* object = nullptr;
@@ -384,6 +559,10 @@ bool ObjectTable::Save(stream::ByteStream* stream) {
 }
 
 bool ObjectTable::Restore(stream::ByteStream* stream) {
+  // T without G: must be a top-level T section and must not look up objects
+  // (that would take G after T). The depth is always 0 with the fast path off.
+  assert_true(table_write_depth_ == 0);
+  TableWriteLock table_lock;  // No G here today; T keeps fast readers out.
   Resize(stream->Read<uint32_t>());
   for (uint32_t i = 0; i < table_capacity_; i++) {
     auto& entry = table_[i];
@@ -395,6 +574,8 @@ bool ObjectTable::Restore(stream::ByteStream* stream) {
 }
 
 X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
+  assert_true(table_write_depth_ == 0);  // Same rule as Restore.
+  TableWriteLock table_lock;  // No G here today; T keeps fast readers out.
   uint32_t slot = GetHandleSlot(handle);
   assert_true(table_capacity_ > slot);
 

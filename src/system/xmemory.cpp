@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -2142,6 +2143,17 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   return BaseHeap::Protect(address, size, protect);
 }
 
+// notify_on_invalidation is only written with the global critical region held,
+// but MayHaveWriteWatches reads it without the lock, so the stores and that
+// lockless load go through atomic_ref. Plain loads under the lock stay as-is.
+static uint64_t LoadWatchBitsRelaxed(const uint64_t& bits) {
+  return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(bits)).load(std::memory_order_relaxed);
+}
+
+static void StoreWatchBitsRelaxed(uint64_t& bits, uint64_t value) {
+  std::atomic_ref<uint64_t>(bits).store(value, std::memory_order_relaxed);
+}
+
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                                          bool enable_invalidation_notifications,
                                          bool enable_data_providers) {
@@ -2230,7 +2242,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
           // stricter protection.
           // A page waiting for GPU data is already inaccessible - keep it so.
           protect_system_page = (page_flags_block.provide_data & page_flags_bit) == 0;
-          page_flags_block.notify_on_invalidation |= page_flags_bit;
+          StoreWatchBitsRelaxed(page_flags_block.notify_on_invalidation,
+                                page_flags_block.notify_on_invalidation | page_flags_bit);
         }
       }
     }
@@ -2251,6 +2264,10 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);
   }
+  // Pairs with the fence in MayHaveWriteWatches. Callers read the watched
+  // memory after this returns, so a lockless writer either sees the bits set
+  // above or wrote its data before that read.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
@@ -2405,10 +2422,60 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     if (i == block_index_last && (system_page_last & 63) != 63) {
       mask |= ~((uint64_t(1) << ((system_page_last & 63) + 1)) - 1);
     }
-    system_page_flags_[i].notify_on_invalidation &= mask;
+    StoreWatchBitsRelaxed(system_page_flags_[i].notify_on_invalidation,
+                          system_page_flags_[i].notify_on_invalidation & mask);
   }
 
   return true;
+}
+
+bool PhysicalHeap::MayHaveWriteWatches(uint32_t virtual_address, uint32_t length) const {
+  // The caller's data writes come before this fence and the bit loads after
+  // it. With the fence at the end of EnableAccessCallbacks this either sees a
+  // newly set bit or the watcher's later read sees the data. Bits are cleared
+  // only after the callbacks ran.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  // Same range clamp and page masks as the check in TriggerCallbacks.
+  if (virtual_address < heap_base_) {
+    if (heap_base_ - virtual_address >= length) {
+      return false;
+    }
+    length -= heap_base_ - virtual_address;
+    virtual_address = heap_base_;
+  }
+  uint32_t heap_relative_address = virtual_address - heap_base_;
+  if (heap_relative_address >= heap_size_) {
+    return false;
+  }
+  length = std::min(length, heap_size_ - heap_relative_address);
+  if (length == 0) {
+    return false;
+  }
+
+  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
+  uint32_t system_page_last =
+      (heap_relative_address + length - 1 + host_address_offset()) / system_page_size_;
+  system_page_last = std::min(system_page_last, system_page_count_ - 1);
+  if (system_page_first > system_page_last) {
+    // Unexpected; let TriggerCallbacks decide.
+    return true;
+  }
+  uint32_t block_index_first = system_page_first >> 6;
+  uint32_t block_index_last = system_page_last >> 6;
+  for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
+    uint64_t block = LoadWatchBitsRelaxed(system_page_flags_[i].notify_on_invalidation);
+    if (i == block_index_first) {
+      block &= ~((uint64_t(1) << (system_page_first & 63)) - 1);
+    }
+    if (i == block_index_last && (system_page_last & 63) != 63) {
+      block &= (uint64_t(1) << ((system_page_last & 63) + 1)) - 1;
+    }
+    if (block) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {

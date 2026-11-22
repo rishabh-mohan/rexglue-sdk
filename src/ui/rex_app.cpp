@@ -49,8 +49,14 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -62,7 +68,73 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "preference), 'd3d12' or 'vulkan'")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(pause_safe_order, false, "UI/Window",
+                    "Pause and unpause the guest without allocating, logging, taking the object "
+                    "table lock or waiting on the audio workers while guest threads are stopped: "
+                    "the pause keeps the threads it suspended and the unpause resumes them first. "
+                    "Off: the original order");
+
+REXCVAR_DEFINE_INT32(debug_pause_cycle_ms, 0, "UI/Window",
+                     "Debug (pause test G): 15 s after the guest starts, pause and unpause it "
+                     "from the UI thread every N ms through the normal pause path. 0 = off");
+
+REXCVAR_DEFINE_INT32(debug_pause_cycle_count, 0, "UI/Window",
+                     "Debug: stop debug_pause_cycle_ms after N full pause/unpause cycles, "
+                     "ending unpaused. 0 = unlimited");
+
 namespace rex {
+
+namespace {
+
+// pause_safe_order: what SetGuestPaused(true) suspended, so that SetGuestPaused(false) can
+// resume it without the object table (lock T, an allocation) while guest threads are stopped.
+// An entry whose Suspend failed stays, with suspended = false: dropping a reference while the
+// guest is stopped could run an XThread destructor, which frees memory and takes locks.
+// Touched on the UI thread only (focus events), like guest_paused_. Never destroyed, so a
+// process that exits while paused does not release thread references after the kernel is gone.
+struct SafeOrderPause {
+  struct Entry {
+    rex::system::object_ref<rex::system::XThread> thread;
+    bool suspended = false;
+  };
+  std::vector<Entry> entries;
+  bool active = false;  // the current pause took this path, so its unpause must take it too
+};
+
+SafeOrderPause& GetSafeOrderPause() {
+  static auto* state = new SafeOrderPause();
+  return *state;
+}
+
+// debug_pause_cycle_ms: a host thread that asks the UI thread to pause and unpause the guest.
+// Never destroyed; ReXApp::OnDestroy stops and joins the thread.
+struct DebugPauseCycle {
+  std::thread thread;
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool stop = false;                  // guarded by mutex
+  std::atomic<bool> stopping{false};  // checked by toggles already posted to the UI thread
+};
+
+DebugPauseCycle& GetDebugPauseCycle() {
+  static auto* state = new DebugPauseCycle();
+  return *state;
+}
+
+void StopDebugPauseCycle() {
+  auto& cycle = GetDebugPauseCycle();
+  cycle.stopping.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(cycle.mutex);
+    cycle.stop = true;
+  }
+  cycle.cv.notify_all();
+  if (cycle.thread.joinable()) {
+    cycle.thread.join();
+  }
+}
+
+}  // namespace
 
 // --- ReXApp ---
 
@@ -567,6 +639,38 @@ void ReXApp::LaunchModule() {
         app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
       }
     });
+
+    // debug_pause_cycle_ms (default 0 = off), for pause test G: the toggles go through the
+    // normal SetGuestPaused path, so pause_safe_order and guest_suspend_guard apply as usual.
+    const int32_t cycle_ms = REXCVAR_GET(debug_pause_cycle_ms);
+    auto& cycle = GetDebugPauseCycle();
+    if (cycle_ms > 0 && !cycle.thread.joinable()) {
+      const int32_t cycle_count = std::max<int32_t>(0, REXCVAR_GET(debug_pause_cycle_count));
+      REXLOG_INFO("Debug pause cycle: every {} ms, {} cycles (0 = unlimited), first pause in 15 s",
+                  cycle_ms, cycle_count);
+      cycle.thread = std::thread([this, cycle_ms, cycle_count, &cycle]() {
+        // True if the whole duration passed without a stop request.
+        auto wait = [&cycle](std::chrono::milliseconds duration) {
+          std::unique_lock<std::mutex> lock(cycle.mutex);
+          return !cycle.cv.wait_for(lock, duration, [&cycle] { return cycle.stop; });
+        };
+        if (!wait(std::chrono::seconds(15))) {
+          return;
+        }
+        for (int64_t done = 0; cycle_count == 0 || done < cycle_count; ++done) {
+          for (bool pause : {true, false}) {
+            app_context().CallInUIThread([this, pause, &cycle]() {
+              if (!cycle.stopping.load(std::memory_order_acquire)) {
+                SetGuestPaused(pause);
+              }
+            });
+            if (!wait(std::chrono::milliseconds(cycle_ms))) {
+              return;
+            }
+          }
+        }
+      });
+    }
   });
 }
 
@@ -634,6 +738,55 @@ void ReXApp::SetGuestPaused(bool paused) {
   }
   guest_paused_ = paused;
 
+  // pause_safe_order (default off; task #17 in perf-notes/agent12-io-memory.md). The pause
+  // picks the path and its unpause follows it, so turning the cvar on or off while the guest
+  // is paused cannot strand a thread.
+  auto& safe_order = GetSafeOrderPause();
+  if (paused ? REXCVAR_GET(pause_safe_order) : safe_order.active) {
+    auto* audio = static_cast<rex::audio::AudioSystem*>(runtime_->audio_system());
+    if (paused) {
+      // Everything that can allocate, log, take a lock a guest thread may hold, or wait on
+      // the audio workers (they run guest callbacks) happens while the guest still runs.
+      // Audio first, so that a thread the guest creates while it waits is still in the list.
+      if (audio) {
+        audio->Pause();
+      }
+      safe_order.entries.clear();
+      {
+        auto threads = kernel_state->object_table()->GetObjectsByType<rex::system::XThread>();
+        safe_order.entries.reserve(threads.size());
+        for (auto& thread : threads) {
+          if (thread && thread->is_guest_thread()) {
+            safe_order.entries.push_back({std::move(thread), false});
+          }
+        }
+      }  // the other references are dropped and the buffer freed here, before any suspension
+      REXLOG_INFO("Guest suspended ({} threads)", safe_order.entries.size());
+      safe_order.active = true;
+      // From here until the unpause this thread allocates, frees and logs nothing.
+      for (auto& entry : safe_order.entries) {
+        entry.suspended = XSUCCEEDED(entry.thread->Suspend(nullptr));
+      }
+    } else {
+      // Resume first, from the pause's own list: no allocation, no log line and no object
+      // table lock until every thread it stopped runs again.
+      size_t resumed = 0;
+      for (auto& entry : safe_order.entries) {
+        if (entry.suspended) {
+          entry.thread->Resume(nullptr);
+          ++resumed;
+        }
+      }
+      safe_order.active = false;
+      if (audio) {
+        audio->Resume();
+      }
+      REXLOG_INFO("Guest resumed ({} threads)", resumed);
+      safe_order.entries.clear();  // drop the references now that nothing is stopped
+    }
+    return;
+  }
+
   // Only the guest's own threads. The host threads behind them - the GPU worker, the
   // audio backend - have to keep running, or nothing would be left to resume them.
   auto threads = kernel_state->object_table()->GetObjectsByType<rex::system::XThread>();
@@ -685,6 +838,9 @@ void ReXApp::OnRestored(ui::UIEvent& e) {
 }
 
 void ReXApp::OnDestroy() {
+  // No more debug_pause_cycle_ms toggles: stop and join its thread first.
+  StopDebugPauseCycle();
+
   // Notify subclass before cleanup
   OnShutdown();
 

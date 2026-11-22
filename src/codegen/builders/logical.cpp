@@ -10,6 +10,7 @@
  */
 
 #include "helpers.h"
+#include "rotate_mask.h"
 
 namespace rex::codegen {
 
@@ -36,7 +37,7 @@ bool build_andi(BuilderContext& ctx) {
               ctx.insn.operands[2]);
   // ANDI. always sets CR0
   ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
-              ctx.xer());
+              compareXer(ctx));
   return true;
 }
 
@@ -45,7 +46,7 @@ bool build_andis(BuilderContext& ctx) {
               ctx.insn.operands[2] << 16);
   // ANDIS. always sets CR0
   ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
-              ctx.xer());
+              compareXer(ctx));
   return true;
 }
 
@@ -277,6 +278,15 @@ bool build_rotldi(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_rlwimi(BuilderContext& ctx) {
+  if (ctx.config().rlwinmLowering) {
+    if (auto s = rlw::lowerRlwimi(ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+                                  ctx.insn.operands[2], ctx.insn.operands[3],
+                                  ctx.insn.operands[4])) {
+      ctx.println("\t{}", *s);
+      emitRecordFormCompare(ctx);
+      return true;
+    }
+  }
   const uint64_t mask = compute_mask(ctx.insn.operands[3] + 32, ctx.insn.operands[4] + 32);
   ctx.println(
       "\t{}.u64 = (__builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X}) | ({}.u64 & "
@@ -288,6 +298,15 @@ bool build_rlwimi(BuilderContext& ctx) {
 }
 
 bool build_rlwinm(BuilderContext& ctx) {
+  if (ctx.config().rlwinmLowering) {
+    if (auto s = rlw::lowerRlwinm(ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+                                  ctx.insn.operands[2], ctx.insn.operands[3],
+                                  ctx.insn.operands[4])) {
+      ctx.println("\t{}", *s);
+      emitRecordFormCompare(ctx);
+      return true;
+    }
+  }
   ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X};",
               ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
               ctx.insn.operands[2],
@@ -297,6 +316,15 @@ bool build_rlwinm(BuilderContext& ctx) {
 }
 
 bool build_rlwnm(BuilderContext& ctx) {
+  if (ctx.config().rlwinmLowering) {
+    if (auto s = rlw::lowerRlwnm(ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+                                 ctx.r(ctx.insn.operands[2]), ctx.insn.operands[3],
+                                 ctx.insn.operands[4])) {
+      ctx.println("\t{}", *s);
+      emitRecordFormCompare(ctx);
+      return true;
+    }
+  }
   // Like rlwinm but shift amount comes from register, not immediate
   ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}.u8 & 0x1F) & 0x{:X};",
               ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),

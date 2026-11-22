@@ -98,11 +98,27 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  /// Ignore the register localization options for this function (see
+  /// EmitContext::registersInCtx). Its registers all live in ctx.
+  bool registersInCtx = false;
+
+  /// cr_compare_so_zero proved that XER.SO is 0 at every compare in this
+  /// function (EmitContext::xerWriters), so compares pass "{}" for XER.
+  bool compareSoZero = false;
+
+  /// skip_lr is on, but this body uses LR as data (EmitContext::lrUsers), so it
+  /// keeps the LR writes and reads.
+  bool keepLr = false;
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 
   /// Get the function graph (single source of truth for function info)
   const FunctionGraph& graph() const;
+
+  /// Whether to emit the LR writes (bl, bctrl, blrl, mtlr) and reads (mflr):
+  /// skip_lr is off, or this body keeps LR (keepLr).
+  bool trackLr() const;
 
   //=========================================================================
   // Register Accessors
@@ -230,6 +246,13 @@ struct BuilderContext {
    * Handles special cases like setjmp/longjmp and __restgprlr_N functions.
    */
   void emit_function_call(uint32_t address);
+
+  /**
+   * @brief Report a transfer to an interior entry from a function that keeps
+   * registers in locals. The writer's registersInCtx set should prevent it.
+   * @param target Address of the branch or call target
+   */
+  void check_register_handoff(uint32_t target) const;
 
   /**
    * @brief Emit C++ code for a conditional branch.

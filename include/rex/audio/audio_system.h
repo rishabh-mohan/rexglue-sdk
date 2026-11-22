@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -60,7 +61,12 @@ class AudioSystem : public system::IAudioSystem {
 
   virtual void Initialize();
 
-  void WorkerThreadMain();
+  // Shutdown hand-off with the worker, used only with audio_shutdown_detach_worker
+  // (defined in audio_system.cpp). Null when the cvar is off.
+  struct WorkerControl;
+  void WorkerThreadMain(WorkerControl* ctl);
+  bool DetachWorker(rex::thread::Thread* host_thread);
+  std::shared_ptr<WorkerControl> worker_control_;
 
   virtual X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
                                 AudioDriver** out_driver) = 0;

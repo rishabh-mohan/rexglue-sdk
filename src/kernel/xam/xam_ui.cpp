@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
+
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -537,9 +539,13 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
     REXKRNL_ERROR("Missing files or bad mounts cause this error");
     REXKRNL_ERROR("===========================================");
   }
-  // This is death, and should never return.
-  // TODO(benvanik): cleaner exit.
-  exit(1);
+  // This is death, and should never return. Any dialog above was shown
+  // synchronously (overlapped 0) and has been closed by now. Hard-exit the way
+  // ReXApp::OnClosing does (flush the logs, then std::_Exit) instead of CRT
+  // exit(), which would run the EXE's atexit handlers and static destructors
+  // on this guest thread while the other threads keep running.
+  rex::FlushLogging();
+  std::_Exit(1);
 }
 
 u32 XamShowPartyUI_entry(u32 r3, u32 r4) {

@@ -13,20 +13,31 @@
 
 #include <rex/logging/api.h>
 
-/* Implementation macro - do not call directly. Uses raw pointer for zero
-   ref-count overhead and gates on should_log() to skip format evaluation. */
-#define REX_LOG_IMPL(cat, lvl, ...)                                                              \
-  do {                                                                                           \
-    auto* rex_log_ptr_ = ::rex::GetLoggerRaw(cat);                                               \
-    if (rex_log_ptr_ && rex_log_ptr_->should_log(lvl))                                           \
-      rex_log_ptr_->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__}, lvl, __VA_ARGS__); \
+/* Implementation macro - do not call directly. A call below the level floor
+   (rex::detail::LogLevelMayBeEnabled) costs one inline compare and does not
+   evaluate `cat`. Above the floor it is the old sequence: raw pointer for zero
+   ref-count overhead, and should_log() to skip format evaluation. Nothing else
+   runs before should_log(), so a call that passes the floor but fails it (every
+   disabled call while log_level_gate is off) costs what it did before: no
+   [[unlikely]] on the floor test (clang then treats the block as cold and calls
+   the category function out of line), and the floor is bound only by a line that
+   is logged. */
+#define REX_LOG_IMPL(cat, lvl, ...)                                                                \
+  do {                                                                                             \
+    if (::rex::detail::LogLevelMayBeEnabled(lvl)) {                                                \
+      auto* rex_log_ptr_ = ::rex::GetLoggerRaw(cat);                                               \
+      if (rex_log_ptr_ && rex_log_ptr_->should_log(lvl)) {                                         \
+        ::rex::detail::BindLogLevelFloor();                                                        \
+        rex_log_ptr_->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__}, lvl, __VA_ARGS__); \
+      }                                                                                            \
+    }                                                                                              \
   } while (0)
 
-#define REX_LOG_NOISY_IMPL(cat, lvl, ...) \
-  do {                                    \
-    if (!REXCVAR_GET(log_noisy))          \
-      break;                              \
-    REX_LOG_IMPL(cat, lvl, __VA_ARGS__);  \
+#define REX_LOG_NOISY_IMPL(cat, lvl, ...)                                     \
+  do {                                                                        \
+    if (!::rex::detail::LogLevelMayBeEnabled(lvl) || !REXCVAR_GET(log_noisy)) \
+      break;                                                                  \
+    REX_LOG_IMPL(cat, lvl, __VA_ARGS__);                                      \
   } while (0)
 
 /* --- Parameterized Macros (Primary API) --------------------------------- */

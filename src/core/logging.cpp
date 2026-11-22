@@ -56,6 +56,10 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files 
     .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(log_level_gate, false, "Log",
+                    "Skip log calls below every logger's level with one inline compare")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 namespace {
@@ -141,6 +145,23 @@ std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
   return logger;
 }
 
+// Lowest level any current or future logger can have; LogLevelMayBeEnabled()
+// skips calls below it. Stays 0 (trace, every call passes) until InitLogging and
+// while log_level_gate is off. A new logger starts at ResolveCategoryLevel(),
+// which the g_config terms cover, so registration needs no recompute.
+void RecomputeLogLevelFloorLocked() {
+  int floor = spdlog::level::trace;
+  if (g_initialized && REXCVAR_GET(log_level_gate)) {
+    floor = g_config.default_level;
+    for (const auto& kv : g_config.category_levels)
+      floor = std::min<int>(floor, kv.second);
+    for (const auto& entry : g_registry)
+      if (entry.logger)
+        floor = std::min<int>(floor, entry.logger->level());
+  }
+  detail::g_log_level_floor.store(floor, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 void InitLoggingEarly() {
@@ -176,6 +197,18 @@ void InitLoggingEarly() {
 }
 
 void InitLogging(const LogConfig& config) {
+  // With the level gate on, a call below the floor no longer evaluates its
+  // category, so register the built-in categories here instead of on first use.
+  if (REXCVAR_GET(log_level_gate)) {
+    (void)log::core();
+    (void)log::cpu();
+    (void)log::apu();
+    (void)log::gpu();
+    (void)log::krnl();
+    (void)log::sys();
+    (void)log::fs();
+  }
+
   std::lock_guard lock(g_mutex);
 
   if (g_initialized) {
@@ -188,6 +221,7 @@ void InitLogging(const LogConfig& config) {
       if (g_config.category_levels.count(entry.name))
         entry.has_explicit_level = true;
     }
+    RecomputeLogLevelFloorLocked();
     return;
   }
 
@@ -255,6 +289,7 @@ void InitLogging(const LogConfig& config) {
     }
   }
   g_initialized = true;
+  RecomputeLogLevelFloorLocked();
 
   // Periodic flush
   int flush_interval = REXCVAR_GET(log_flush_interval);
@@ -286,6 +321,7 @@ void ShutdownLogging() {
   g_extra_sinks.clear();
   g_initialized = false;
   g_early_initialized = false;
+  RecomputeLogLevelFloorLocked();
 }
 
 void FlushLogging() {
@@ -384,6 +420,7 @@ void SetCategoryLevel(LogCategoryId category, spdlog::level::level_enum level) {
       logger->set_level(level);
     }
   }
+  RefreshLogLevelFloor();
 }
 
 void SetAllLevels(spdlog::level::level_enum level) {
@@ -391,6 +428,7 @@ void SetAllLevels(spdlog::level::level_enum level) {
     if (entry.logger)
       entry.logger->set_level(level);
   }
+  RefreshLogLevelFloor();
 }
 
 void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
@@ -400,7 +438,21 @@ void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
         entry.logger)
       entry.logger->set_level(level);
   }
+  RefreshLogLevelFloor();
 }
+
+void RefreshLogLevelFloor() {
+  std::lock_guard lock(g_mutex);
+  RecomputeLogLevelFloorLocked();
+}
+
+namespace detail {
+
+const std::atomic<int>* SharedLogLevelFloor() {
+  return &g_log_level_floor;
+}
+
+}  // namespace detail
 
 void RegisterLogLevelCallback() {
   rex::cvar::RegisterChangeCallback("log_level", [](std::string_view, std::string_view value) {

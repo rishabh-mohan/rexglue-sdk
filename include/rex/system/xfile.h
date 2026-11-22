@@ -13,6 +13,7 @@
 #include <string>
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/entry.h>
@@ -129,11 +130,28 @@ class XFile : public XObject {
 
   X_STATUS ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
                         uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion);
+  // The read itself: access checks, host read, fixups and invalidation
+  // callbacks. Of this object it only uses file_ and name(), so positional
+  // reads may run it without file_lock_ (holding unlocked_read_lock_ shared).
+  X_STATUS ReadData(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
+                    size_t* out_bytes_read);
+  // Position update, out value and completion notification. Needs file_lock_.
+  X_STATUS CompleteRead(X_STATUS result, uint32_t buffer_length, uint64_t byte_offset,
+                        size_t bytes_read, uint32_t* out_bytes_read, uint32_t apc_context,
+                        bool notify_completion);
+  // ReadScatter with an explicit offset: runs of contiguous pages may be read
+  // at once (coalesce), and the reads may skip file_lock_ (unlocked).
+  X_STATUS ReadScatterPositional(uint32_t segments_guest_address, uint32_t length,
+                                 uint64_t byte_offset, uint32_t* out_bytes_read,
+                                 uint32_t apc_context, bool coalesce, bool unlocked);
 
   rex::filesystem::File* file_ = nullptr;
   std::unique_ptr<rex::thread::Event> async_event_ = nullptr;
 
   mutable std::mutex file_lock_;
+  // Held shared by reads running without file_lock_ (the fixups read name())
+  // and exclusively by Rename.
+  std::shared_mutex unlocked_read_lock_;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
 
@@ -145,6 +163,9 @@ class XFile : public XObject {
   size_t find_index_ = 0;
 
   bool is_synchronous_ = false;
+  // Set with file_. Positional reads may skip file_lock_ (see
+  // AllowsUnlockedReads in xfile.cpp).
+  bool unlocked_reads_ok_ = false;
 };
 
 }  // namespace rex::system

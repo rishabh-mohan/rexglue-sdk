@@ -101,6 +101,13 @@ struct RecompilerConfig {
   bool nonVolatileRegistersAsLocalVariables = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
+  // Emission-only optimizations. Each one off keeps the emitted text unchanged.
+  bool rlwinmLowering = false;    ///< 32-bit shift/rotate forms for rlwinm/rlwnm/rlwimi
+  bool flushModeElision = false;  ///< No flush-mode switch for mode-independent FP/VMX ops
+  bool crCompareSoZero = false;   ///< Compares store SO=0 when no image instruction sets XER.SO
+  bool musttailCalls = false;     ///< Tail calls as [[clang::musttail]] return f(ctx, base)
+  bool vmxVectorFallbacks = false;  ///< SSE forms for VMX ops emitted as scalar lane loops
+
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets
   uint32_t dataRegionThreshold = 16;  ///< Consecutive invalid instructions to mark as data region

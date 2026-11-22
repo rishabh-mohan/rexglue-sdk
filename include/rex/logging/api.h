@@ -13,6 +13,7 @@
 
 #include <rex/logging/types.h>
 
+#include <atomic>
 #include <filesystem>
 #include <span>
 
@@ -123,6 +124,47 @@ std::span<const LogCategoryEntry> GetAllCategories();
  * @return          Raw pointer to the spdlog logger (not owning).
  */
 spdlog::logger* GetLoggerRaw(LogCategoryId category);
+
+/**
+ * Recompute the level floor used by the logging macros (cvar log_level_gate).
+ *
+ * InitLogging and the Set*Level functions keep the floor current. Call this
+ * after changing a logger's level directly through spdlog.
+ */
+void RefreshLogLevelFloor();
+
+namespace detail {
+
+// Level floor for the logging macros: a call below it cannot pass any logger's
+// should_log(), so the macro skips it without evaluating the category. Only the
+// copy in the module that contains logging.cpp is written. Inline variables are
+// per module (WINDOWS_EXPORT_ALL_SYMBOLS exports functions, not importable data),
+// so each module reads the floor through g_log_level_floor_ptr. It starts at the
+// module's own copy (0 = trace, every call takes the full path) and is bound to
+// the shared floor by the module's first enabled log line (BindLogLevelFloor).
+inline constinit std::atomic<int> g_log_level_floor{0};
+inline constinit std::atomic<const std::atomic<int>*> g_log_level_floor_ptr{&g_log_level_floor};
+inline constinit std::atomic<bool> g_log_level_floor_bound{false};
+
+const std::atomic<int>* SharedLogLevelFloor();
+
+inline bool LogLevelMayBeEnabled(int level) {
+  return level >=
+         g_log_level_floor_ptr.load(std::memory_order_relaxed)->load(std::memory_order_relaxed);
+}
+
+// Points this module's floor at the shared one. The logging macros call it only for
+// a line that passes should_log(), so a call that is filtered out pays nothing for it.
+// A module that has never logged an enabled line keeps reading its own floor (0): its
+// calls all take the full path, which costs speed but changes no output.
+inline void BindLogLevelFloor() {
+  if (!g_log_level_floor_bound.load(std::memory_order_relaxed)) [[unlikely]] {
+    g_log_level_floor_ptr.store(SharedLogLevelFloor(), std::memory_order_relaxed);
+    g_log_level_floor_bound.store(true, std::memory_order_relaxed);
+  }
+}
+
+}  // namespace detail
 
 /**
  * Get the shared logger pointer for a category.

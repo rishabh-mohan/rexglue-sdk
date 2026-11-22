@@ -20,6 +20,10 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "relative to game://. Used for "
                     "generating test data to compare with original hardware.");
 
+REXCVAR_DEFINE_BOOL(vfs_defer_open_exists_check, false, "Filesystem",
+                    "On a read-only open of an existing cached host file, skip the host stat and "
+                    "check only if the open fails (the result is the same)");
+
 namespace rex::filesystem {
 
 VirtualFileSystem::VirtualFileSystem() {}
@@ -229,6 +233,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
 
+  // Set when the host check below is left until Open fails.
+  const HostPathEntry* deferred_host_parent = nullptr;
   if (entry) {
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
       return X_STATUS_FILE_IS_A_DIRECTORY;
@@ -238,10 +244,18 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     if (parent_entry) {
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
-        const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
-        if (!std::filesystem::exists(file_path)) {
-          entry->Delete();
-          entry = nullptr;
+        if (creation_disposition == FileDisposition::kOpen &&
+            !(desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData)) &&
+            REXCVAR_GET(vfs_defer_open_exists_check)) {
+          // Nothing before Open depends on it for a read-only open, and Open
+          // of a file that's gone fails, so check only then.
+          deferred_host_parent = host_path_entry;
+        } else {
+          const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
+          if (!std::filesystem::exists(file_path)) {
+            entry->Delete();
+            entry = nullptr;
+          }
         }
       }
     }
@@ -328,6 +342,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   // Open.
   auto result = entry->Open(desired_access, out_file);
   if (XFAILED(result)) {
+    if (deferred_host_parent &&
+        !std::filesystem::exists(deferred_host_parent->host_path() / rex::to_path(entry->name()))) {
+      // As if the eager check above had found it gone.
+      entry->Delete();
+      result = X_STATUS_NO_SUCH_FILE;
+    }
     *out_action = FileAction::kDoesNotExist;
   }
   return result;

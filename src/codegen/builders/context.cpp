@@ -38,6 +38,10 @@ const FunctionGraph& BuilderContext::graph() const {
   return emitCtx.graph;
 }
 
+bool BuilderContext::trackLr() const {
+  return !config().skipLr || keepLr;
+}
+
 //=============================================================================
 // Register Accessors
 //=============================================================================
@@ -45,12 +49,13 @@ const FunctionGraph& BuilderContext::graph() const {
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters() &&
+         !registersInCtx;
 }
 
 std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
+  if ((cfg.nonArgumentRegistersAsLocalVariables && !registersInCtx &&
        (index == 0 || index == 2 || index == 11 || index == 12)) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.r[index] = true;
@@ -61,7 +66,7 @@ std::string BuilderContext::r(size_t index) {
 
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
+  if ((cfg.nonArgumentRegistersAsLocalVariables && !registersInCtx && index == 0) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
@@ -71,7 +76,8 @@ std::string BuilderContext::f(size_t index) {
 
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+  if ((cfg.nonArgumentRegistersAsLocalVariables && !registersInCtx &&
+       (index >= 32 && index <= 63)) ||
       (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
@@ -80,7 +86,7 @@ std::string BuilderContext::v(size_t index) {
 }
 
 std::string BuilderContext::cr(size_t index) {
-  if (config().crRegistersAsLocalVariables) {
+  if (config().crRegistersAsLocalVariables && !registersInCtx) {
     locals.cr[index] = true;
     return fmt::format("cr{}", index);
   }
@@ -88,7 +94,7 @@ std::string BuilderContext::cr(size_t index) {
 }
 
 const char* BuilderContext::ctr() {
-  if (config().ctrAsLocalVariable) {
+  if (config().ctrAsLocalVariable && !registersInCtx) {
     locals.ctr = true;
     return "ctr";
   }
@@ -96,7 +102,7 @@ const char* BuilderContext::ctr() {
 }
 
 const char* BuilderContext::xer() {
-  if (config().xerAsLocalVariable) {
+  if (config().xerAsLocalVariable && !registersInCtx) {
     locals.xer = true;
     return "xer";
   }
@@ -104,7 +110,7 @@ const char* BuilderContext::xer() {
 }
 
 const char* BuilderContext::reserved() {
-  if (config().reservedRegisterAsLocalVariable) {
+  if (config().reservedRegisterAsLocalVariable && !registersInCtx) {
     locals.reserved = true;
     return "reserved";
   }
@@ -172,6 +178,134 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+void BuilderContext::check_register_handoff(uint32_t target) const {
+  if (!registersInCtx && emitCtx.interiorEntries && emitCtx.interiorEntries->contains(target)) {
+    REXCODEGEN_ERROR("0x{:08X} in 0x{:08X} reaches interior entry 0x{:08X} with localized registers",
+                     base, fn.base(), target);
+    if (emitCtx.handoffErrors)
+      ++*emitCtx.handoffErrors;
+  }
+}
+
+//=============================================================================
+// Guest Tail Calls (RecompilerConfig::musttailCalls, TOML musttail_calls)
+//=============================================================================
+//
+// With musttail_calls on, a guest tail call is emitted as
+//   [[clang::musttail]] return NAME(ctx, base);
+// instead of `NAME(ctx, base);` + `return;`. clang then has to lower it to a
+// jmp at every optimization level, and the host stack stops growing along guest
+// tail-call chains. That is valid because every guest function and import is
+// declared through REX_FUNC with the one signature
+// void(PPCContext& __restrict, uint8_t*), the call passes the caller's own
+// parameters through, and no generated local has a non-trivial destructor
+// (bench/agent9/musttail/README.md). The old text stays wherever that is not
+// provable:
+//  - SEH-wrapped bodies (generateExceptionHandlers with SEH scopes): a musttail
+//    cannot leave the __try / SehGuard try block (compile error), and the
+//    handler would no longer cover the callee.
+//  - Functions that call setjmp (setJmpAddress): the saved context refers to
+//    this frame, which a musttail releases before the callee could longjmp.
+//  - Anything but the plain one-line call: longjmp, setjmp, elided
+//    __save/__rest helpers, the SEH-funclet register handoff, unresolved targets.
+// REX_FUNC_PROLOGUE declares a Tracy zone (non-trivial destructor) when
+// REXGLUE_PROFILE_GUEST_FUNCTIONS and REXGLUE_ENABLE_PROFILING are both defined,
+// and clang rejects every musttail in that build: keep the option off there.
+// Mid-asm hooks get references to locals and must not keep them past the hook
+// call: the frame is gone before the tail-called function runs.
+
+namespace {
+
+constexpr std::string_view kMustTailReturn = "[[clang::musttail]] return ";
+
+// Whether a direct branch in this function targets setJmpAddress, so that
+// emit_function_call() puts ppc_setjmp() in this frame. Both readings of the
+// displacement (relative, and absolute for AA=1) count, which is conservative.
+bool calls_setjmp(const BuilderContext& ctx) {
+  const uint32_t target = ctx.config().setJmpAddress;
+  if (target == 0)
+    return false;
+  for (const auto& block : ctx.fn.blocks()) {
+    const uint8_t* p = ctx.emitCtx.binary.translate(block.base);
+    if (!p)
+      continue;
+    for (uint32_t addr = block.base; addr < block.end(); addr += 4, p += 4) {
+      const uint32_t w = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                         (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+      int32_t disp;
+      if ((w >> 26) == 18)  // b, ba, bl, bla: LI
+        disp = (int32_t(w << 6) >> 6) & ~3;
+      else if ((w >> 26) == 16)  // bc, bca, bcl, bcla: BD
+        disp = int32_t(int16_t(w & 0xFFFC));
+      else
+        continue;
+      if (addr + uint32_t(disp) == target || uint32_t(disp) == target)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool musttail_allowed(const BuilderContext& ctx) {
+  const auto& cfg = ctx.config();
+  if (!cfg.musttailCalls)
+    return false;
+  // The generateSeh test of FunctionNode::recompile(): the body is in SEH_TRY.
+  if (cfg.generateExceptionHandlers && ctx.fn.hasExceptionInfo()) {
+    const auto* seh = ctx.fn.exceptionInfo()->asSeh();
+    if (seh && !seh->scopes.empty())
+      return false;
+  }
+  return !calls_setjmp(ctx);
+}
+
+bool is_identifier(std::string_view s) {
+  if (s.empty() || (s[0] >= '0' && s[0] <= '9'))
+    return false;
+  for (char c : s) {
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+      return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+// `<indent>NAME(ctx, base);` and `<indent>return;`, or the single line
+// `<indent>[[clang::musttail]] return NAME(ctx, base);` where musttail is
+// allowed. Used by the conditional tail calls below and by bctr jump tables.
+void emit_tail_call_line(BuilderContext& ctx, std::string_view indent, std::string_view name) {
+  if (musttail_allowed(ctx)) {
+    ctx.println("{}{}{}(ctx, base);", indent, kMustTailReturn, name);
+    return;
+  }
+  ctx.println("{}{}(ctx, base);", indent, name);
+  ctx.println("{}return;", indent);
+}
+
+// A `b` tail call: emit_function_call() followed by `return;`. Where musttail
+// is allowed and the call came out as the plain line `\tNAME(ctx, base);`, that
+// line becomes the musttail return; every other form keeps its text and the
+// `return;`.
+void emit_tail_call(BuilderContext& ctx, uint32_t address) {
+  const size_t mark = ctx.out.size();
+  ctx.emit_function_call(address);
+  if (musttail_allowed(ctx)) {
+    constexpr std::string_view kCallEnd = "(ctx, base);\n";
+    const std::string_view call = std::string_view(ctx.out).substr(mark);
+    if (call.size() > 1 + kCallEnd.size() && call.front() == '\t' && call.ends_with(kCallEnd)) {
+      const std::string_view name = call.substr(1, call.size() - 1 - kCallEnd.size());
+      if (is_identifier(name)) {
+        std::string line = fmt::format("\t{}{}(ctx, base);\n", kMustTailReturn, name);
+        ctx.out.resize(mark);
+        ctx.out += line;
+        return;
+      }
+    }
+  }
+  ctx.println("\treturn;");
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -197,12 +331,15 @@ void BuilderContext::emit_function_call(uint32_t address) {
     if (target->isFunction()) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
+      check_register_handoff(static_cast<uint32_t>(targetFn->base()));
 
       // Handle save/restore helpers. Gated on the global setting, not this
       // function's: the helper bodies are emitted under it too, so once they
       // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
+      // frame. A share_registers function still has to elide them. A
+      // registersInCtx function keeps its non-volatiles in ctx and needs the
+      // real save/restore; the writer emits the helpers in ctx for it.
+      if (cfg.nonVolatileRegistersAsLocalVariables && !registersInCtx &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         // print nothing - these are handled by local variable tracking
         return;
@@ -337,10 +474,10 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
       if (const auto* callTarget = findCallTarget(base)) {
         if (callTarget->isFunction()) {
           auto* targetFn = callTarget->asFunction();
+          check_register_handoff(static_cast<uint32_t>(targetFn->base()));
           emitCtx.reference(targetFn->name());
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", targetFn->name());
-          println("\t\treturn;");
+          emit_tail_call_line(*this, "\t\t", targetFn->name());
           println("\t}}");
         } else if (callTarget->isImport()) {
           const auto& importTarget = std::get<CallTarget::ToImport>(callTarget->value);
@@ -349,8 +486,7 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           std::replace(func_name.begin(), func_name.end(), '.', '_');
           emitCtx.reference(func_name);
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", func_name);
-          println("\t\treturn;");
+          emit_tail_call_line(*this, "\t\t", func_name);
           println("\t}}");
         }
       } else {

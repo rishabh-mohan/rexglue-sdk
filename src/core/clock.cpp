@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <mutex>
 
@@ -21,6 +22,10 @@ REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
+
+REXCVAR_DEFINE_BOOL(clock_lockfree, false, "Clock",
+                    "Read the guest clock without taking a lock (applied when the guest clock "
+                    "rate is set, at startup)");
 
 namespace rex::chrono {
 
@@ -42,6 +47,89 @@ uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
 std::mutex tick_mutex_;
 
+// Lock-free guest clock (a seqlock). While clock_den_ != 0, the guest tick
+// count at host tick t is
+//   clock_guest_base_ + (t - clock_host_base_) * clock_num_ / clock_den_.
+// Only SetGuestTickRatioLocked writes these, under tick_mutex_; clock_seq_ is
+// odd while it does. clock_den_ == 0 selects the locked clock below.
+std::atomic<uint32_t> clock_seq_{0};
+std::atomic<uint64_t> clock_host_base_{0};
+std::atomic<uint64_t> clock_guest_base_{0};
+std::atomic<uint64_t> clock_num_{0};
+std::atomic<uint64_t> clock_den_{0};
+
+// delta * num / den, exact while num * den < 2^64 (checked when publishing).
+inline uint64_t ScaleTickDelta(uint64_t delta, uint64_t num, uint64_t den) {
+  return (delta / den) * num + (delta % den) * num / den;
+}
+
+// With tick_mutex_ held: switch the guest clock to the ratio `frac`.
+void SetGuestTickRatioLocked(std::pair<uint64_t, uint64_t> frac) {
+  const uint64_t old_den = clock_den_.load(std::memory_order_relaxed);
+  const bool lock_free = REXCVAR_GET(clock_lockfree) && frac.second != 0 &&
+                         frac.first <= std::numeric_limits<uint64_t>::max() / frac.second;
+  if (!lock_free && !old_den) {
+    guest_tick_ratio_ = frac;  // Locked clock only, exactly as before.
+    return;
+  }
+
+  const uint32_t seq = clock_seq_.load(std::memory_order_relaxed);
+  clock_seq_.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+
+  // Rebase at the current time so the clock stays continuous. Lock-free
+  // readers have been using the published ratio; the locked clock applies a
+  // new ratio from its last update on, as UpdateGuestClock always did.
+  const uint64_t now = Clock::QueryHostTickCount();
+  uint64_t guest_now;
+  if (old_den) {
+    const uint64_t host_base = clock_host_base_.load(std::memory_order_relaxed);
+    guest_now = clock_guest_base_.load(std::memory_order_relaxed) +
+                ScaleTickDelta(now > host_base ? now - host_base : 0,
+                               clock_num_.load(std::memory_order_relaxed), old_den);
+  } else {
+    const uint64_t delta = now > last_host_tick_count_ ? now - last_host_tick_count_ : 0;
+    guest_now = last_guest_tick_count_ + delta * frac.first / frac.second;
+  }
+  last_host_tick_count_ = now;
+  last_guest_tick_count_ = guest_now;
+  guest_tick_ratio_ = frac;
+
+  clock_host_base_.store(now, std::memory_order_relaxed);
+  clock_guest_base_.store(guest_now, std::memory_order_relaxed);
+  clock_num_.store(frac.first, std::memory_order_relaxed);
+  clock_den_.store(lock_free ? frac.second : 0, std::memory_order_relaxed);
+  clock_seq_.store(seq + 2, std::memory_order_release);
+}
+
+// Reads the guest clock without the lock. False if the lock-free clock is
+// off, or a rate change is in progress (the caller then takes the lock).
+bool ReadGuestClockLockFree(uint64_t* guest_tick_count) {
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    const uint32_t seq = clock_seq_.load(std::memory_order_acquire);
+    const uint64_t den = clock_den_.load(std::memory_order_relaxed);
+    if (!den) {
+      return false;
+    }
+    if (seq & 1) {
+      continue;
+    }
+    const uint64_t num = clock_num_.load(std::memory_order_relaxed);
+    const uint64_t host_base = clock_host_base_.load(std::memory_order_relaxed);
+    const uint64_t guest_base = clock_guest_base_.load(std::memory_order_relaxed);
+    // Sample the host clock inside the read window, after the parameters.
+    const uint64_t now = Clock::QueryHostTickCount();
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (clock_seq_.load(std::memory_order_relaxed) != seq) {
+      continue;
+    }
+    *guest_tick_count =
+        guest_base + ScaleTickDelta(now > host_base ? now - host_base : 0, num, den);
+    return true;
+  }
+  return false;
+}
+
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
   auto frac = std::make_pair(guest_tick_frequency_, Clock::QueryHostTickFrequency());
@@ -58,12 +146,19 @@ void RecomputeGuestTickScalar() {
   reduce_fraction(frac);
 
   std::lock_guard<std::mutex> lock(tick_mutex_);
-  guest_tick_ratio_ = frac;
+  SetGuestTickRatioLocked(frac);
 }
 
 // Update the guest timer for all threads.
 // Return a copy of the value so locking is reduced.
 uint64_t UpdateGuestClock() {
+  if (!REXCVAR_GET(clock_no_scaling)) {
+    uint64_t guest_tick_count;
+    if (ReadGuestClockLockFree(&guest_tick_count)) {
+      return guest_tick_count;
+    }
+  }
+
   uint64_t host_tick_count = Clock::QueryHostTickCount();
 
   if (REXCVAR_GET(clock_no_scaling)) {

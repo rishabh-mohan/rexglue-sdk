@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,6 +27,7 @@
 #include <rex/codegen/output_partition.h>
 #include <rex/codegen/template_registry.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 
@@ -49,10 +51,6 @@ bool ValidateFunctionBodies(const rex::codegen::RecompilerConfig& config,
     if ((address & 3) || (function.bodyOwner & 3) || function.parent ||
         address == function.bodyOwner)
       return reject("body requires a distinct aligned owner and cannot be a chunk");
-    if (config.ctrAsLocalVariable || config.xerAsLocalVariable ||
-        config.reservedRegisterAsLocalVariable || config.crRegistersAsLocalVariables ||
-        config.nonArgumentRegistersAsLocalVariables || config.nonVolatileRegistersAsLocalVariables)
-      return reject("interior body entries require all register localization options disabled");
     auto ownerConfig = config.functions.find(function.bodyOwner);
     if (ownerConfig != config.functions.end() && ownerConfig->second.bodyOwner)
       return reject("nested or cyclic body owners are unsupported");
@@ -149,6 +147,93 @@ bool ValidateFunctionBodies(const rex::codegen::RecompilerConfig& config,
   return true;
 }
 
+// Register localization assumes every transfer into a function is a real call
+// whose callee reads only argument registers from ctx. An interior entry breaks
+// that: the code before it can leave any register live. So while a localization
+// option is on, interior entries (body= entries and entries inside another
+// function's blocks), body owners and every function with a direct edge or jump
+// table into an interior entry keep all registers in ctx. Those make real calls
+// to the save/restore helpers, so the helpers keep their registers in ctx too.
+struct RegisterFallback {
+  std::unordered_set<uint32_t> interior;
+  std::unordered_set<uint32_t> inCtx;
+};
+
+RegisterFallback BuildRegisterFallback(const rex::codegen::RecompilerConfig& config,
+                                       const rex::codegen::FunctionGraph& graph) {
+  RegisterFallback result;
+  if (!config.ctrAsLocalVariable && !config.xerAsLocalVariable &&
+      !config.reservedRegisterAsLocalVariable && !config.crRegistersAsLocalVariables &&
+      !config.nonArgumentRegistersAsLocalVariables && !config.nonVolatileRegistersAsLocalVariables)
+    return result;
+
+  auto isHelper = [](const rex::codegen::FunctionNode& node) {
+    return node.authority() == rex::codegen::FunctionAuthority::HELPER ||
+           node.name().starts_with("__save") || node.name().starts_with("__rest");
+  };
+  size_t owners = 0;
+  for (const auto& [address, function] : config.functions) {
+    if (function.bodyOwner && result.interior.insert(address).second)
+      owners += result.inCtx.insert(function.bodyOwner).second;
+  }
+  const size_t bodyEntries = result.interior.size();
+
+  // Helpers overlap each other by design and are not interior entries.
+  std::set<uint32_t> entries;
+  for (const auto& [address, node] : graph.functions()) {
+    if (!node->isImport() && !isHelper(*node))
+      entries.insert(address);
+  }
+  for (const auto& [address, node] : graph.functions()) {
+    if (node->isImport() || isHelper(*node))
+      continue;
+    for (const auto& block : node->blocks()) {
+      for (auto it = entries.lower_bound(block.base); it != entries.end() && *it < block.end();
+           ++it) {
+        if (*it != address)
+          result.interior.insert(*it);
+      }
+    }
+  }
+  if (result.interior.empty())
+    return result;
+
+  auto hitsInterior = [&](const std::vector<uint32_t>& targets) {
+    return std::any_of(targets.begin(), targets.end(),
+                       [&](uint32_t target) { return result.interior.contains(target); });
+  };
+  auto intoInterior = [&](const rex::codegen::CallEdge& edge) {
+    const auto* target = edge.target.asFunction();
+    return target && result.interior.contains(static_cast<uint32_t>(target->base()));
+  };
+  size_t callers = 0, helpers = 0;
+  for (const auto& [address, node] : graph.functions()) {
+    bool reaches = std::any_of(node->calls().begin(), node->calls().end(), intoInterior) ||
+                   std::any_of(node->tailCalls().begin(), node->tailCalls().end(), intoInterior) ||
+                   std::any_of(node->jumpTables().begin(), node->jumpTables().end(),
+                               [&](const auto& table) { return hitsInterior(table.targets); });
+    if (reaches && !result.interior.contains(address))
+      callers += result.inCtx.insert(address).second;
+    else if (isHelper(*node))
+      helpers += result.inCtx.insert(address).second;
+  }
+  for (const auto& [bctr, table] : config.switchTables) {
+    if (!hitsInterior(table.targets))
+      continue;
+    for (const auto& [address, node] : graph.functions()) {
+      if (std::any_of(node->blocks().begin(), node->blocks().end(),
+                      [&](const auto& block) { return block.contains(bctr); }))
+        callers += result.inCtx.insert(address).second;
+    }
+  }
+  result.inCtx.insert(result.interior.begin(), result.interior.end());
+  REXCODEGEN_INFO(
+      "Register localization fallback: {} functions keep registers in ctx ({} interior entries, "
+      "{} of them body=; {} more body owners, {} callers, {} save/restore helpers)",
+      result.inCtx.size(), result.interior.size(), bodyEntries, owners, callers, helpers);
+  return result;
+}
+
 nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
                                  const std::vector<const rex::codegen::FunctionNode*>& functions,
                                  const std::unordered_map<uint32_t, std::string>& rexcrtByAddr) {
@@ -232,6 +317,116 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
 
 namespace rex::codegen {
 
+// cr_compare_so_zero. Generated code writes XER.SO only in mtxer
+// (build_mtspr) and through mid-asm hooks that take xer: OE forms do not model
+// SO. A local xer is zero-initialized. ctx.xer.so starts at 0 (ThreadState
+// value-initializes its PPCContext, and so do GuestToHostFunction, the
+// auto-isolating ImportFunction call and the hook call contexts), and the
+// runtime only copies it (XThread::SaveContext/LoadContext). The one exception
+// is rex::CallFrame (hook.h): it leaves every register except r1, r13 and fpscr
+// uninitialized, so a guest call through it reads an indeterminate XER.SO with
+// or without this option (no LEGO code uses CallFrame). So SO is 0 at every
+// compare of a body without a writer whose XER is local, and of every body
+// without a writer when no body that keeps XER in ctx has one.
+void PrepareEmitAnalyses(EmitContext& emitCtx, const std::vector<const FunctionNode*>& functions,
+                         EmitAnalyses& storage) {
+  const auto& config = emitCtx.config;
+  auto fallback = BuildRegisterFallback(config, emitCtx.graph);
+  storage.interiorEntries = std::move(fallback.interior);
+  storage.registersInCtx = std::move(fallback.inCtx);
+  if (!storage.registersInCtx.empty()) {
+    emitCtx.interiorEntries = &storage.interiorEntries;
+    emitCtx.registersInCtx = &storage.registersInCtx;
+  }
+  // The blocks an entry's text is emitted from: its body= owner's, or its own.
+  auto bodyOf = [&](const FunctionNode* fn) {
+    const auto configured = config.functions.find(fn->base());
+    const auto* body = configured != config.functions.end() && configured->second.bodyOwner
+                           ? emitCtx.graph.getFunction(configured->second.bodyOwner)
+                           : fn;
+    return body ? body : fn;
+  };
+
+  // skip_lr drops every LR write (bl, bctrl, blrl, mtlr) and read (mflr). That
+  // is safe where LR only carries the return address: blr is `return;` either
+  // way, and mflr/mtlr just move it through the stack. A body that uses LR as
+  // data would read a stale ctx.lr: `mtlr rX; blrl` calls through it, and a bl
+  // to one of the body's own labels (`bl $+4; mflr rY`) takes an address from
+  // it. Such a body (a bclrl, i.e. blrl or a conditional form, or a bl that
+  // build_bl emits as a local goto) keeps LR exactly as without skip_lr.
+  if (config.skipLr) {
+    constexpr uint32_t kBclrlMask = 0xFC0007FF;  // opcode 19, XO 16, LK 1, any BO/BI
+    constexpr uint32_t kBclrl = 0x4C000021;
+    constexpr uint32_t kBlMask = 0xFC000003;  // opcode 18, AA 0, LK 1
+    constexpr uint32_t kBl = 0x48000001;
+    for (const auto* fn : functions) {
+      bool usesLr = false;
+      for (const auto& block : bodyOf(fn)->blocks()) {
+        const auto* data = reinterpret_cast<const uint8_t*>(emitCtx.binary.translate(block.base));
+        for (size_t offset = 0; data && !usesLr && block.base + offset < block.end(); offset += 4) {
+          const auto pc = static_cast<uint32_t>(block.base + offset);
+          const uint32_t word = rex::memory::load_and_swap<uint32_t>(data + offset);
+          if ((word & kBclrlMask) == kBclrl) {
+            usesLr = true;
+          } else if ((word & kBlMask) == kBl) {
+            // The classification build_bl uses: InternalLabel becomes a goto.
+            const auto disp = (static_cast<int32_t>(word << 6) >> 6) & ~3;
+            const uint32_t target = pc + static_cast<uint32_t>(disp);
+            usesLr = emitCtx.graph.classifyTarget(target, pc, true) ==
+                     rex::codegen::TargetKind::InternalLabel;
+          }
+        }
+        if (usesLr)
+          break;
+      }
+      if (usesLr)
+        storage.lrUsers.insert(static_cast<uint32_t>(fn->base()));
+    }
+    emitCtx.lrUsers = &storage.lrUsers;
+    REXCODEGEN_INFO("skip_lr: {} functions use LR as data (blrl, or bl to a local label) and keep LR",
+                    storage.lrUsers.size());
+  }
+
+  if (!config.crCompareSoZero)
+    return;
+
+  std::vector<uint32_t> hookWriters;
+  for (const auto& [address, hook] : config.midAsmHooks) {
+    if (std::any_of(hook.registers.begin(), hook.registers.end(),
+                    [](const std::string& reg) { return !reg.empty() && reg[0] == 'x'; }))
+      hookWriters.push_back(address);
+  }
+  constexpr uint32_t kMtxerMask = 0xFC1FFFFF;  // mtspr XER, rS with rS masked out
+  constexpr uint32_t kMtxer = 0x7C0103A6;
+  size_t inCtxWriters = 0;
+  for (const auto* fn : functions) {
+    const auto* body = bodyOf(fn);
+    bool writes = false;
+    for (const auto& block : body->blocks()) {
+      const auto* data = reinterpret_cast<const uint8_t*>(emitCtx.binary.translate(block.base));
+      for (size_t offset = 0; data && !writes && block.base + offset < block.end(); offset += 4)
+        writes = (rex::memory::load_and_swap<uint32_t>(data + offset) & kMtxerMask) == kMtxer;
+      writes = writes || std::any_of(hookWriters.begin(), hookWriters.end(),
+                                     [&](uint32_t hook) { return block.contains(hook); });
+      if (writes)
+        break;
+    }
+    if (!writes)
+      continue;
+    const auto address = static_cast<uint32_t>(fn->base());
+    storage.xerWriters.insert(address);
+    if (!config.xerAsLocalVariable || storage.registersInCtx.contains(address))
+      ++inCtxWriters;
+  }
+  emitCtx.xerWriters = &storage.xerWriters;
+  emitCtx.ctxXerWritten = inCtxWriters != 0;
+  REXCODEGEN_INFO(
+      "cr_compare_so_zero: {} functions write XER.SO ({} keep XER in ctx); the others compare "
+      "with SO = 0{}",
+      storage.xerWriters.size(), inCtxWriters,
+      inCtxWriters ? " where their XER is local" : "");
+}
+
 bool IsGeneratedOutputName(std::string_view filename, std::string_view projectName) {
   auto dot = filename.rfind('.');
   if (dot == std::string_view::npos)
@@ -296,6 +491,16 @@ bool CodegenWriter::write(bool force) {
   }
   if (!ValidateFunctionBodies(config(), graph(), binary()))
     return false;
+  // The FPR/VMX save/restore helpers take r12/r11 implicitly from ctx. Their calls
+  // are elided only with non_volatile_as_local, so a local r11/r12 would hand a
+  // real helper call a stale ctx value (function_scanner.cpp helper patterns).
+  if (config().nonArgumentRegistersAsLocalVariables &&
+      !config().nonVolatileRegistersAsLocalVariables) {
+    REXCODEGEN_ERROR(
+        "non_argument_as_local requires non_volatile_as_local: the save/restore helpers read "
+        "r11/r12 from ctx");
+    return false;
+  }
 
   // --- Output directory setup (from recompile.cpp) ---
   std::filesystem::path outputPath = ctx_.configDir() / config().outDirectoryPath;
@@ -373,6 +578,11 @@ bool CodegenWriter::write(bool force) {
   if (runtime_)
     emitCtx.resolver = runtime_->export_resolver();
 
+  // Interior entries and everything that can reach them keep registers in ctx;
+  // cr_compare_so_zero needs the XER.SO writers.
+  EmitAnalyses analyses;
+  PrepareEmitAnalyses(emitCtx, functions, analyses);
+
   REXCODEGEN_TRACE("Recompiling {} functions...", functions.size());
 
   std::vector<std::string> bodies;
@@ -385,6 +595,8 @@ bool CodegenWriter::write(bool force) {
   const size_t maxFileBytes = REXCVAR_GET(max_file_size_bytes);
   std::unordered_set<std::string> referenced;
   emitCtx.referenced = &referenced;
+  size_t handoffErrors = 0;
+  emitCtx.handoffErrors = &handoffErrors;
   for (const auto* fn : functions) {
     referenced.clear();
     const auto configured = config().functions.find(fn->base());
@@ -400,6 +612,17 @@ bool CodegenWriter::write(bool force) {
     references.push_back(referenced);
   }
   emitCtx.referenced = nullptr;
+  emitCtx.handoffErrors = nullptr;
+  if (handoffErrors) {
+    // Nothing has been flushed yet: drop the buffered headers too.
+    REXCODEGEN_ERROR(
+        "Code generation blocked: {} control transfers reach an interior entry with localized "
+        "registers",
+        handoffErrors);
+    pendingWrites.clear();
+    out.clear();
+    return false;
+  }
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);

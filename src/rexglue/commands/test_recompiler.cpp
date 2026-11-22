@@ -209,31 +209,43 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
     return false;
   };
 
-  while (getline()) {
+  // The test function a label line starts (symbols holds only labels at test
+  // function addresses), or symbols.end().
+  auto testLabel = [&](const std::string& text) {
+    auto colonIndex = text.find(':');
+    return colonIndex == std::string::npos ? symbols.end()
+                                           : symbols.find(text.substr(0, colonIndex));
+  };
+
+  // When `pending` is set, `line` already holds the next line to parse. The
+  // scan of one test stops at the label of the next test (after a test without
+  // annotations, such as a tail-call target) or at the first line after its
+  // outputs, and that line must not be skipped.
+  bool pending = false;
+  while (pending || getline()) {
+    pending = false;
     if (line.empty() || line[0] == '#')
       continue;
-    auto colonIndex = line.find(':');
-    if (colonIndex == std::string::npos)
-      continue;
-    auto name = line.substr(0, colonIndex);
-    auto symbolIt = symbols.find(name);
+    auto symbolIt = testLabel(line);
     if (symbolIt == symbols.end())
       continue;
 
     TestSpec spec;
-    spec.name = name;
+    spec.name = symbolIt->first;
     spec.symbol = symbolIt->second;
 
-    while (getline() && !line.empty() && line[0] == '#') {
+    bool more = getline();
+    while (more && !line.empty() && line[0] == '#') {
       ApplyDirective(line, "REGISTER_IN", "MEMORY_IN", spec.inputs, spec.mem_inputs);
+      more = getline();
     }
-    while (line.empty() || line[0] != '#') {
-      if (!getline())
-        break;
-    }
-    do {
+    while (more && (line.empty() || line[0] != '#') && testLabel(line) == symbols.end())
+      more = getline();
+    while (more && !line.empty() && line[0] == '#') {
       ApplyDirective(line, "REGISTER_OUT", "MEMORY_OUT", spec.outputs, spec.mem_outputs);
-    } while (getline() && !line.empty() && line[0] == '#');
+      more = getline();
+    }
+    pending = more;
 
     if (!spec.inputs.empty() || !spec.outputs.empty() || !spec.mem_inputs.empty() ||
         !spec.mem_outputs.empty()) {
@@ -299,11 +311,13 @@ std::string CategoryFromStem(std::string_view stem) {
   return "misc";
 }
 
-bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir) {
-  std::array<ui::KeyValueRow, 3> header_rows = {{
+bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir,
+                    std::string_view configPath) {
+  std::array<ui::KeyValueRow, 4> header_rows = {{
       {"Bin dir", std::string(binDir)},
       {"ASM dir", std::string(asmDir)},
       {"Output dir", std::string(outDir)},
+      {"Codegen options", configPath.empty() ? std::string("defaults") : std::string(configPath)},
   }};
   ui::KeyValueBlock("Recompiling PPC tests:", header_rows);
 
@@ -312,6 +326,20 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
   std::map<std::string, std::unordered_set<size_t>> functionsByFile;
   std::vector<std::string> allFunctionNames;
   std::stringstream functionsOut;
+
+  // --config: codegen option keys (root TOML keys such as cr_as_local = true)
+  // for every test binary, so the asm tests run with those options. The test
+  // binaries have no XEX, so file_path and out_directory_path are preset for
+  // the loader's required-field check (a file_path key in the TOML still wins).
+  codegen::RecompilerConfig options;
+  if (!configPath.empty()) {
+    options.filePath = std::string(configPath);
+    options.outDirectoryPath = std::string(outDir);
+    if (!options.Load(configPath)) {
+      REXLOG_ERROR("Failed to load codegen options: {}", configPath);
+      return false;
+    }
+  }
 
   for (const auto& entry : fs::directory_iterator(binDir)) {
     if (entry.path().extension() != ".bin")
@@ -345,7 +373,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     module.Load(kTestBaseAddress, fileData.data(), fileData.size());
     module.set_name(stem);
 
-    codegen::RecompilerConfig config;
+    codegen::RecompilerConfig config = options;
     config.outDirectoryPath = std::string(outDir);
     auto ctx =
         codegen::CodegenContext::Create(codegen::BinaryView::fromModule(module), std::move(config));
@@ -362,6 +390,12 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
               [](const auto* a, const auto* b) { return a->base() < b->base(); });
 
     codegen::EmitContext emitCtx{ctx.binary(), ctx.Config(), ctx.graph, 0, nullptr};
+    // Same analyses as CodegenWriter::write (register localization fallback,
+    // cr_compare_so_zero), and the same handoff check.
+    codegen::EmitAnalyses analyses;
+    codegen::PrepareEmitAnalyses(emitCtx, functions, analyses);
+    size_t handoffErrors = 0;
+    emitCtx.handoffErrors = &handoffErrors;
 
     std::string recompiledCode;
     for (const auto* fn : functions) {
@@ -371,6 +405,11 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
       functionsByFile[stem].emplace(fn->base());
       allFunctionNames.push_back(fmt::format("{}_{:X}", stem, fn->base()));
       recompiledCode += code;
+    }
+    if (handoffErrors) {
+      REXLOG_ERROR("{}: {} control transfers reach an interior entry with localized registers",
+                   stem, handoffErrors);
+      return false;
     }
     functionsOut << recompiledCode << '\n';
   }
@@ -417,12 +456,23 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
   templateData["code_base"] = "82010000";
   templateData["code_size"] = "100000";
 
+  // Under cr_as_local the CR fields are function locals: ctx.cr is not written,
+  // so a "REGISTER_OUT cr" expectation does not describe the function's result.
+  // Those expectations are dropped (and counted) for such runs; the default run
+  // still checks them, and the GPR/memory outputs are checked in both runs.
+  const bool dropCrOutputs = options.crRegistersAsLocalVariables;
+  size_t droppedCrOutputs = 0;
   templateData["tests"] = nlohmann::json::array();
   size_t totalTests = 0;
   for (const auto& [stem, addresses] : functionsByFile) {
     auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), allSymbols);
     std::string category = CategoryFromStem(stem);
     for (const auto& spec : specs) {
+      std::vector<RegValue> outputs = spec.outputs;
+      if (dropCrOutputs) {
+        droppedCrOutputs +=
+            std::erase_if(outputs, [](const RegValue& rv) { return rv.reg == "cr"; });
+      }
       nlohmann::json testJson;
       testJson["name"] = BuildHierarchicalName(stem, spec.name);
       testJson["category"] = category;
@@ -430,11 +480,15 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
       testJson["symbol"] = spec.symbol;
       testJson["inputs"]["registers"] = SerializeRegisters(spec.inputs);
       testJson["inputs"]["memory"] = SerializeMemory(spec.mem_inputs);
-      testJson["outputs"]["registers"] = SerializeRegisters(spec.outputs);
+      testJson["outputs"]["registers"] = SerializeRegisters(outputs);
       testJson["outputs"]["memory"] = SerializeMemory(spec.mem_outputs);
       templateData["tests"].push_back(testJson);
       ++totalTests;
     }
+  }
+  if (droppedCrOutputs) {
+    REXLOG_WARN("cr_as_local: dropped {} REGISTER_OUT cr expectations (CR is a function local)",
+                droppedCrOutputs);
   }
 
   codegen::TemplateRegistry registry;
@@ -456,6 +510,7 @@ struct RecompileTestsArgs {
   std::string bin_dir;
   std::string asm_dir;
   std::string output;
+  std::string config;
 };
 
 }  // namespace
@@ -474,9 +529,12 @@ void RegisterRecompileTests(CLI::App& parent, const CliContext& ctx, DeferredAct
   sub->add_option("--output", args->output, "Output path for recompile-tests")
       ->type_name("PATH")
       ->required();
+  sub->add_option("--config", args->config,
+                  "TOML with codegen option keys (e.g. cr_as_local = true) for every test binary")
+      ->type_name("PATH");
   sub->callback([args, &pending]() {
     pending = [args]() -> rex::Result<void> {
-      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output)) {
+      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output, args->config)) {
         return Err<void>(rex::ErrorCategory::Validation, "Test recompilation failed");
       }
       return rex::Ok();

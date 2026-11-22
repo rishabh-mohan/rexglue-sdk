@@ -1,0 +1,15 @@
+# Codegen options for the ppc_tests_opt variant:
+#   rexglue recompile-tests --config tests/ppc/opt_config.toml ...
+# Root keys only (the same keys as a project's codegen TOML; see src/codegen/config.cpp).
+# Deliberately off: skip_msr, non_argument_as_local, non_volatile_as_local.
+
+skip_lr = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+rlwinm_lowering = true
+cr_compare_so_zero = true
+musttail_calls = true
+vmx_vector_fallbacks = true
+flush_mode_elision = true

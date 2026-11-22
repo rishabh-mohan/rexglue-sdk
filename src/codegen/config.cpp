@@ -116,6 +116,16 @@ bool ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
+  MergeBool(cfg.rlwinmLowering, toml["rlwinm_lowering"].value_or(false),
+            hasBool("rlwinm_lowering"), "rlwinm_lowering");
+  MergeBool(cfg.flushModeElision, toml["flush_mode_elision"].value_or(false),
+            hasBool("flush_mode_elision"), "flush_mode_elision");
+  MergeBool(cfg.crCompareSoZero, toml["cr_compare_so_zero"].value_or(false),
+            hasBool("cr_compare_so_zero"), "cr_compare_so_zero");
+  MergeBool(cfg.musttailCalls, toml["musttail_calls"].value_or(false),
+            hasBool("musttail_calls"), "musttail_calls");
+  MergeBool(cfg.vmxVectorFallbacks, toml["vmx_vector_fallbacks"].value_or(false),
+            hasBool("vmx_vector_fallbacks"), "vmx_vector_fallbacks");
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

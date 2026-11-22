@@ -8,7 +8,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace rex::codegen;
@@ -17,13 +21,25 @@ constexpr uint32_t kBase = 0x82000000;
 constexpr uint32_t kEntry = kBase + 0x18;
 constexpr uint32_t kExtraOwner = kBase + 0x40;
 constexpr uint32_t kExtraEntry = kBase + 0x48;
+constexpr uint32_t kSwitch = kBase + 0x90;
+constexpr uint32_t kSwitchBctr = kBase + 0xAC;
+
+// How the jump table of sub_82000090 reaches codegen: not at all, as one of the
+// function's analysed jump tables, or as a config switch table.
+enum class SwitchTable { None, Analysis, Config };
+
+// The table at +0xB8: case 0 tail-calls the body= entry, case 1 a plain
+// function, case 2 a local label.
+JumpTable EntrySwitch(uint32_t case0 = kEntry) {
+  return JumpTable{kSwitchBctr, kBase + 0xB8, 3, {case0, kBase + 0x88, kBase + 0xB0}};
+}
 
 void Check(bool result, const char* message) {
   if (!result) throw std::runtime_error(message);
 }
 
-std::vector<uint8_t> Bytes(bool externalHole = false) {
-  std::vector<uint8_t> bytes(0x90);
+std::vector<uint8_t> Bytes(bool externalHole = false, bool switchTable = false) {
+  std::vector<uint8_t> bytes(switchTable ? 0xC4 : 0x90);
   auto put = [&](unsigned offset, uint32_t instruction) {
     for (unsigned i = 0; i < 4; ++i)
       bytes[offset + i] = static_cast<uint8_t>(instruction >> (24 - i * 8));
@@ -61,13 +77,37 @@ std::vector<uint8_t> Bytes(bool externalHole = false) {
   put(0x84, 0x4E800020);
   put(0x88, 0x38C60001);  // addi r6,r6,1
   put(0x8C, 0x4E800020);
+  if (switchTable) {
+    // A bounded absolute switch on r3 through the table at +0xB8 (EntrySwitch).
+    put(0x90, 0x3D608200);  // lis r11,0x8200
+    put(0x94, 0x396B00B8);  // addi r11,r11,0xB8 (table below)
+    put(0x98, 0x28030002);  // cmplwi r3,2
+    put(0x9C, 0x41810014);  // bgt +0xB0 (default)
+    put(0xA0, 0x546C103A);  // slwi r12,r3,2
+    put(0xA4, 0x7C0B602E);  // lwzx r0,r11,r12
+    put(0xA8, 0x7C0903A6);  // mtctr r0
+    put(0xAC, 0x4E800420);  // bctr
+    put(0xB0, 0x4E800020);  // blr
+    put(0xB8, kEntry);      // case 0: interior (body=) entry
+    put(0xBC, kBase + 0x88);  // case 1: plain function
+    put(0xC0, kBase + 0xB0);  // case 2: local label
+  }
   return bytes;
 }
 
 CodegenContext Context(const fs::path& root, RecompilerConfig config,
                        bool missingEntry = false, uint32_t pendingTarget = 0,
-                       bool externalHole = false) {
-  auto bytes = Bytes(externalHole);
+                       bool externalHole = false, bool localizationProbe = false,
+                       SwitchTable switchTable = SwitchTable::None) {
+  auto bytes = Bytes(externalHole, switchTable != SwitchTable::None);
+  if (switchTable == SwitchTable::Config)
+    config.switchTables.try_emplace(kSwitchBctr, EntrySwitch());
+  if (localizationProbe) {
+    // lwarx r0,0,r31 replaces the nop shared by the extra owner and entry.
+    constexpr uint32_t probe = 0x7C00F828;
+    for (unsigned i = 0; i < 4; ++i)
+      bytes[0x48 + i] = static_cast<uint8_t>(probe >> (24 - i * 8));
+  }
   if (pendingTarget) {
     uint32_t instruction = 0x41820000 | ((pendingTarget - (kBase + 0x1C)) & 0xFFFC);
     for (unsigned i = 0; i < 4; ++i)
@@ -110,9 +150,133 @@ CodegenContext Context(const fs::path& root, RecompilerConfig config,
   for (auto* node : {helper, extraHelper, owner, entry, extraOwner, extraEntry}) {
     if (node != entry || !pendingTarget) node->seal();
   }
+  if (switchTable != SwitchTable::None) {
+    auto* dispatcher = add(kSwitch, 0x24, {{kSwitch, 0x24}});
+    ctx.graph.addLabelToFunction(kSwitch, kBase + 0xB0);
+    if (switchTable == SwitchTable::Analysis)
+      ctx.graph.addJumpTableToFunction(kSwitch, EntrySwitch());
+    dispatcher->seal();
+  }
   if (pendingTarget)
     Check(entry->isDiscovered() && !entry->isSealed() && entry->unresolvedJumps().size() == 1,
           "fixture must retain a genuinely unsealed deferred alias branch");
+  return ctx;
+}
+
+// Concatenated text of a project's emitted recompiled translation units.
+std::string ReadSources(const fs::path& dir, const std::string& project) {
+  std::string all;
+  for (const auto& file : fs::recursive_directory_iterator(dir)) {
+    auto name = file.path().filename().string();
+    if (!file.is_regular_file() || name.rfind(project + "_recomp.", 0) != 0 ||
+        file.path().extension() != ".cpp")
+      continue;
+    std::ifstream in(file.path(), std::ios::binary);
+    all.append(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    all += '\n';
+  }
+  Check(!all.empty(), "no recompiled translation units emitted");
+  return all;
+}
+
+// One emitted function, from its definition to the next one.
+std::string FunctionText(const std::string& sources, const std::string& name) {
+  auto start = sources.find("DEFINE_REX_FUNC(" + name + ") {");
+  Check(start != std::string::npos, "expected function missing from the output");
+  auto end = sources.find("DEFINE_REX_FUNC(", start + 1);
+  return sources.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+// Names of the register locals a function declares (ctr, xer, reserved, crN,
+// rN, fN, vN); scratch locals such as temp, vTemp, env and ea are ignored.
+std::set<std::string> RegisterLocals(const std::string& text) {
+  std::set<std::string> names;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    auto eol = text.find('\n', pos);
+    if (eol == std::string::npos) eol = text.size();
+    std::string line = text.substr(pos, eol - pos);
+    pos = eol + 1;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("\tPPC", 0) != 0 || line.size() < 4 ||
+        line.compare(line.size() - 3, 3, "{};") != 0)
+      continue;
+    auto space = line.rfind(' ');
+    if (space == std::string::npos) continue;
+    auto name = line.substr(space + 1, line.size() - space - 4);
+    if (name != "temp" && name != "vTemp" && name != "env") names.insert(name);
+  }
+  return names;
+}
+
+// A plain function without body= entries that touches every localizable
+// register class: cmpwi r3,1 (cr0, xer.so); mtctr r4; addic r5,r5,1 (xer.ca);
+// lwarx r6,0,r4 (reserved); li r0,1; li r31,1; blr.
+CodegenContext ControlContext(const fs::path& root, const std::vector<bool RecompilerConfig::*>& flags) {
+  constexpr std::array<uint32_t, 7> code{0x2C030001, 0x7C8903A6, 0x30A50001, 0x7CC02028,
+                                         0x38000001, 0x3BE00001, 0x4E800020};
+  std::vector<uint8_t> bytes;
+  for (auto instruction : code)
+    for (unsigned i = 0; i < 4; ++i)
+      bytes.push_back(static_cast<uint8_t>(instruction >> (24 - i * 8)));
+  TestModule module;
+  module.Load(kBase, bytes.data(), bytes.size());
+  RecompilerConfig config;
+  config.projectName = "control";
+  config.outDirectoryPath = "generated";
+  for (auto flag : flags) config.*flag = true;
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.setConfigDir(root);
+  ctx.analysisState().format = "xex";
+  ctx.analysisState().loadAddress = kBase;
+  ctx.analysisState().entryPoint = kBase;
+  ctx.analysisState().imageSize = static_cast<uint32_t>(bytes.size());
+  auto* node = ctx.graph.addFunction(kBase, static_cast<uint32_t>(bytes.size()),
+                                     FunctionAuthority::CONFIG, true);
+  Check(node != nullptr, "control node rejected");
+  node->discover({{kBase, static_cast<uint32_t>(bytes.size())}}, {}, {});
+  node->seal();
+  return ctx;
+}
+
+// skip_lr keeps LR in the bodies that use it as data and drops it elsewhere.
+// sub_82000000: mtlr r11; blrl; blr (calls through LR). sub_82000010: bl $+4;
+// mflr r3; blr (PIC: reads its own address from LR). xstart (+0x20): mflr r12;
+// bl sub_82000000; mtlr r12; blr, which only saves and restores the return
+// address around a call.
+CodegenContext LrContext(const fs::path& root, bool skipLr) {
+  constexpr std::array<uint32_t, 12> code{
+      0x7D6803A6, 0x4E800021, 0x4E800020, 0x60000000,   // +0x00
+      0x48000005, 0x7C6802A6, 0x4E800020, 0x60000000,   // +0x10
+      0x7D8802A6, 0x4BFFFFDD, 0x7D8803A6, 0x4E800020};  // +0x20
+  std::vector<uint8_t> bytes;
+  for (auto instruction : code)
+    for (unsigned i = 0; i < 4; ++i)
+      bytes.push_back(static_cast<uint8_t>(instruction >> (24 - i * 8)));
+  TestModule module;
+  module.Load(kBase, bytes.data(), bytes.size());
+  RecompilerConfig config;
+  config.projectName = "lr";
+  config.outDirectoryPath = "generated";
+  config.skipLr = skipLr;
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.setConfigDir(root);
+  ctx.analysisState().format = "xex";
+  ctx.analysisState().loadAddress = kBase;
+  ctx.analysisState().entryPoint = kBase + 0x20;
+  ctx.analysisState().imageSize = static_cast<uint32_t>(bytes.size());
+  auto add = [&](uint32_t address, uint32_t size) {
+    auto* node = ctx.graph.addFunction(address, size, FunctionAuthority::CONFIG, true);
+    Check(node != nullptr, "skip_lr fixture node rejected");
+    node->discover({{address, size}}, {}, {});
+    return node;
+  };
+  auto* blrl = add(kBase, 0xC);
+  auto* pic = add(kBase + 0x10, 0xC);
+  auto* saver = add(kBase + 0x20, 0x10);
+  ctx.graph.addLabelToFunction(kBase + 0x10, kBase + 0x14);
+  ctx.graph.addCallToFunction(kBase + 0x20, kBase + 0x24, CallTarget::function(blrl));
+  for (auto* node : {blrl, pic, saver}) node->seal();
   return ctx;
 }
 
@@ -237,18 +401,156 @@ int main(int argc, char** argv) try {
   invalid = config;
   invalid.rexcrtFunctions["test"] = kEntry;
   reject(invalid, "rexcrt-entry");
-  constexpr std::array flags{
-      &RecompilerConfig::ctrAsLocalVariable, &RecompilerConfig::xerAsLocalVariable,
-      &RecompilerConfig::reservedRegisterAsLocalVariable,
-      &RecompilerConfig::crRegistersAsLocalVariables,
-      &RecompilerConfig::nonArgumentRegistersAsLocalVariables,
-      &RecompilerConfig::nonVolatileRegistersAsLocalVariables};
-  unsigned index = 0;
-  for (auto flag : flags) {
-    invalid = config;
-    invalid.*flag = true;
-    auto name = "localization-" + std::to_string(index++);
-    reject(invalid, name.c_str());
+  // Register localization no longer rejects body= entries. Interior entries,
+  // their owners and partners keep every register in ctx (per-function
+  // fallback). Each case must emit, those four functions must declare no
+  // register local, and a control module without body= entries must still get
+  // the locals, which proves the flag itself took effect. The probe fixture
+  // puts lwarx r0,0,r31 in the extra owner/entry block so reserved, r0 and r31
+  // would be localized there without the fallback.
+  using Flag = bool RecompilerConfig::*;
+  const Flag ctrFlag = &RecompilerConfig::ctrAsLocalVariable;
+  const Flag xerFlag = &RecompilerConfig::xerAsLocalVariable;
+  const Flag reservedFlag = &RecompilerConfig::reservedRegisterAsLocalVariable;
+  const Flag crFlag = &RecompilerConfig::crRegistersAsLocalVariables;
+  const Flag nonArgumentFlag = &RecompilerConfig::nonArgumentRegistersAsLocalVariables;
+  const Flag nonVolatileFlag = &RecompilerConfig::nonVolatileRegistersAsLocalVariables;
+  struct Localization {
+    const char* name;
+    std::vector<Flag> flags;
+    std::set<std::string> controlLocals;
+  };
+  const std::vector<Localization> localizations{
+      {"ctr", {ctrFlag}, {"ctr"}},
+      {"xer", {xerFlag}, {"xer"}},
+      {"reserved", {reservedFlag}, {"reserved"}},
+      {"cr", {crFlag}, {"cr0"}},
+      {"non-volatile", {nonVolatileFlag}, {"r31"}},
+      {"non-argument-and-non-volatile", {nonArgumentFlag, nonVolatileFlag}, {"r0", "r31"}},
+      {"all", {ctrFlag, xerFlag, reservedFlag, crFlag, nonArgumentFlag, nonVolatileFlag},
+       {"ctr", "xer", "reserved", "cr0", "r0", "r31"}}};
+  for (const auto& localization : localizations) {
+    auto localized = config;
+    for (auto flag : localization.flags) localized.*flag = true;
+    auto out = root / (std::string("localization-") + localization.name);
+    auto probe = Context(out, localized, false, 0, false, true);
+    CodegenWriter probeWriter(probe);
+    Check(probeWriter.write(false), "register localization rejected a body= fixture");
+    auto sources = ReadSources(out / "generated", "interior");
+    for (const char* function : {"sub_82000000", "sub_82000018", "sub_82000040", "sub_82000048"}) {
+      Check(RegisterLocals(FunctionText(sources, function)).empty(),
+            "interior entry, owner or partner kept a localized register");
+    }
+    auto controlOut = root / (std::string("localization-control-") + localization.name);
+    auto control = ControlContext(controlOut, localization.flags);
+    CodegenWriter controlWriter(control);
+    Check(controlWriter.write(false), "localization control module emission failed");
+    auto controlLocals = RegisterLocals(FunctionText(ReadSources(controlOut / "generated", "control"),
+                                                     "xstart"));
+    for (const auto& expected : localization.controlLocals) {
+      Check(controlLocals.count(expected) == 1, "localization flag had no effect on the control module");
+    }
+  }
+  // Localized r11/r12 with r14-r31 kept in ctx would split one live value
+  // between ctx and a local across the save/restore helpers, so the writer
+  // refuses non_argument without non_volatile.
+  invalid = config;
+  invalid.nonArgumentRegistersAsLocalVariables = true;
+  reject(invalid, "localization-non-argument-only");
+  // sub_82000090 reaches the body= entry only through case 0 of a jump table.
+  // Whether the table is one of the function's analysed jump tables or a config
+  // switch table, the fallback must keep the dispatcher's registers in ctx (its
+  // cmplwi would otherwise write a local cr0) while it still emits the switch
+  // and the tail call. Without localization the same switch is emitted. A table
+  // that reaches no interior entry leaves the dispatcher localized.
+  auto switchText = [&](const char* name, RecompilerConfig switchConfig, SwitchTable table) {
+    auto out = root / name;
+    auto module = Context(out, std::move(switchConfig), false, 0, false, false, table);
+    CodegenWriter switchWriter(module);
+    Check(switchWriter.write(false), "switch fixture emission failed");
+    return FunctionText(ReadSources(out / "generated", "interior"), "sub_82000090");
+  };
+  auto dispatchesToEntry = [](const std::string& text) {
+    return text.find("switch (") != std::string::npos &&
+           text.find("sub_82000018(ctx, base);") != std::string::npos;
+  };
+  auto switchLocalized = config;
+  switchLocalized.crRegistersAsLocalVariables = true;
+  for (auto table : {SwitchTable::Analysis, SwitchTable::Config}) {
+    const bool analysed = table == SwitchTable::Analysis;
+    auto control = switchText(analysed ? "switch-analysis-control" : "switch-config-control",
+                              config, table);
+    Check(dispatchesToEntry(control), "switch control did not tail-call the body= entry");
+    auto localized = switchText(analysed ? "switch-analysis-localized" : "switch-config-localized",
+                                switchLocalized, table);
+    Check(dispatchesToEntry(localized) && RegisterLocals(localized).empty(),
+          "a switch into a body= entry kept a localized register");
+  }
+  auto precise = switchLocalized;
+  precise.switchTables.emplace(kSwitchBctr, EntrySwitch(kBase + 0x80));
+  Check(RegisterLocals(switchText("switch-precision", precise, SwitchTable::Config)).count("cr0") == 1,
+        "a switch that reaches no interior entry lost its localized registers");
+  // The fallback covers every graph edge and config switch table into an
+  // interior entry, so BuilderContext::check_register_handoff has no known
+  // trigger through write(). It guards future gaps, such as jump tables found
+  // only during emission (emitCpp's late detection, whose mtctr pattern
+  // currently never matches). Drive the production emitter with an incomplete
+  // fallback: the switch case into the body= entry must be counted (write()
+  // then fails before flushing any output), and must not be once the
+  // dispatcher keeps its registers in ctx.
+  {
+    auto net = Context(root / "switch-safety-net", switchLocalized, false, 0, false, false,
+                       SwitchTable::Config);
+    const std::unordered_set<uint32_t> interior{kEntry, kExtraEntry};
+    const std::unordered_set<uint32_t> none;
+    const std::unordered_set<uint32_t> dispatcher{kSwitch};
+    size_t errors = 0;
+    EmitContext netEmission{net.binary(), net.Config(), net.graph, kBase + 0x80};
+    netEmission.interiorEntries = &interior;
+    netEmission.registersInCtx = &none;
+    netEmission.handoffErrors = &errors;
+    const auto* node = net.graph.getFunction(kSwitch);
+    Check(node != nullptr, "switch dispatcher missing from the graph");
+    Check(dispatchesToEntry(node->emitCpp(netEmission)) && errors == 1,
+          "handoff check missed a localized switch case into a body= entry");
+    errors = 0;
+    netEmission.registersInCtx = &dispatcher;
+    Check(dispatchesToEntry(node->emitCpp(netEmission)) && errors == 0,
+          "handoff check fired for a dispatcher that keeps its registers in ctx");
+  }
+  // skip_lr: the blrl and PIC bodies keep LR, with the same text as without
+  // skip_lr, and the body that only saves and restores the return address
+  // around a call drops every LR access.
+  {
+    std::string controlBlrl, controlPic;
+    for (bool skipLr : {false, true}) {
+      auto out = root / (skipLr ? "skip-lr" : "skip-lr-control");
+      auto lrModule = LrContext(out, skipLr);
+      CodegenWriter lrWriter(lrModule);
+      Check(lrWriter.write(false), "skip_lr fixture emission failed");
+      auto sources = ReadSources(out / "generated", "lr");
+      auto blrl = FunctionText(sources, "sub_82000000");
+      auto pic = FunctionText(sources, "sub_82000010");
+      auto saver = FunctionText(sources, "xstart");
+      Check(blrl.find("ctx.lr = ctx.r11.u64;") != std::string::npos &&
+                blrl.find("auto old_lr = ctx.lr;") != std::string::npos,
+            "blrl lost the LR it calls through");
+      Check(pic.find("ctx.lr = 0x82000014;") != std::string::npos &&
+                pic.find("ctx.r3.u64 = ctx.lr;") != std::string::npos,
+            "bl $+4; mflr lost the address it reads from LR");
+      Check(saver.find("sub_82000000(ctx, base);") != std::string::npos,
+            "skip_lr fixture call missing");
+      Check((saver.find("ctx.lr") == std::string::npos) == skipLr,
+            skipLr ? "skip_lr kept LR in a body that only saves it"
+                   : "LR accesses missing without skip_lr");
+      if (!skipLr) {
+        controlBlrl = blrl;
+        controlPic = pic;
+      } else {
+        Check(blrl == controlBlrl && pic == controlPic,
+              "a body that uses LR as data differs from its output without skip_lr");
+      }
+    }
   }
   // Invalid body values must fail config loading, rather than silently discard
   // the override and emit the original lossy isolated function.
@@ -260,7 +562,9 @@ int main(int argc, char** argv) try {
     RecompilerConfig bad;
     Check(!bad.Load(path.string()), "invalid TOML body accepted");
   }
-  std::cout << "Real sealed/deferred codegen body emission and 21 rejection cases passed\n";
+  std::cout << "Real sealed/deferred codegen body emission, 7 register localization fallback "
+               "cases, 5 switch-table fallback cases, the emitter handoff safety net, 2 skip_lr "
+               "LR-use cases and 16 rejection cases passed\n";
   return 0;
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';

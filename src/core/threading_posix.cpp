@@ -8,6 +8,8 @@
 
 #include <rex/platform.h>
 #include <rex/thread.h>
+#include <rex/threading_suspend.h>
+#include <rex/threading_timing.h>
 
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
 
@@ -227,6 +229,20 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
     auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
     Sleep(std::min(remaining, std::chrono::microseconds(1000)));
   }
+}
+
+// nanosleep is already precise, and there is no system timer resolution to
+// raise: these only exist so that callers need no platform checks.
+SleepResult AlertableSleepPrecise(std::chrono::microseconds duration) {
+  return AlertableSleep(duration);
+}
+
+void ConfigureHostTiming(const HostTimingConfig&) {}
+
+void RestoreHostTiming() {}
+
+bool WaitUntilSuspended(Thread*) {
+  return true;
 }
 
 TlsHandle AllocateTlsHandle() {

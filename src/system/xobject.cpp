@@ -9,10 +9,15 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <bit>
+#include <cstdint>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/stream.h>
+#include <rex/threading_timeout.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
 #include <rex/system/xobject.h>
@@ -27,7 +32,76 @@
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
 
+REXCVAR_DEFINE_BOOL(wait_timeout_round_up, false, "Kernel",
+                    "Timed waits: round timeouts up to whole ms instead of truncating them, and "
+                    "honour absolute timeouts instead of polling");
+
 namespace rex::system {
+
+namespace util {
+// Defined in object_table.cpp. Declared here because object_table.h is part of
+// the generated-code PCH.
+bool ObjectLookupFastPathEnabled();
+void LockObjectTableForSuspend();
+void UnlockObjectTableForSuspend();
+}  // namespace util
+
+namespace {
+
+// object_lookup_fast_path: holds the table lock T exclusive for its lifetime;
+// a no-op when the fast path is off. Nests with AddHandle's own T section.
+class ObjectTableExclusiveScope {
+ public:
+  ObjectTableExclusiveScope() { util::LockObjectTableForSuspend(); }
+  ~ObjectTableExclusiveScope() { util::UnlockObjectTableForSuspend(); }
+  ObjectTableExclusiveScope(const ObjectTableExclusiveScope&) = delete;
+  ObjectTableExclusiveScope& operator=(const ObjectTableExclusiveScope&) = delete;
+};
+
+// kXObjSignature as stored in guest memory (big-endian).
+constexpr uint32_t kXObjSignatureStored = std::endian::native == std::endian::big
+                                              ? static_cast<uint32_t>(kXObjSignature)
+                                              : rex::byte_swap(static_cast<uint32_t>(kXObjSignature));
+
+bool IsAtomicRefAligned(const uint32_t* p) {
+  return reinterpret_cast<uintptr_t>(p) % std::atomic_ref<uint32_t>::required_alignment == 0;
+}
+
+// XObject::StashHandle (xobject.h) writes the signature before the handle.
+// This writes the handle first and the signature last, with release ordering,
+// so a reader that doesn't hold the global critical region (the
+// object_lookup_fast_path) never sees the signature next to a stale handle.
+void StashHandleOrdered(X_DISPATCH_HEADER* header, uint32_t handle) {
+  header->wait_list_blink = handle;
+  uint32_t* flink = &header->wait_list_flink.value;
+  if (IsAtomicRefAligned(flink)) {
+    std::atomic_ref<uint32_t>(*flink).store(kXObjSignatureStored, std::memory_order_release);
+  } else {
+    std::atomic_thread_fence(std::memory_order_release);
+    header->wait_list_flink = kXObjSignature;
+  }
+}
+
+// object_lookup_fast_path: finds the object behind a guest dispatcher header
+// that already carries our stash, without the global critical region. Returns
+// null when there is no stash or its handle doesn't resolve; the caller then
+// takes the locked path, which handles both exactly as before.
+object_ref<XObject> LookupStashedObjectFast(KernelState* kernel_state,
+                                            X_DISPATCH_HEADER* header) {
+  uint32_t* flink = &header->wait_list_flink.value;
+  if (!IsAtomicRefAligned(flink)) {
+    return object_ref<XObject>();
+  }
+  // Pairs with the release store in StashHandleOrdered: once the signature is
+  // visible, so are the handle and the fully set-up object it names.
+  if (std::atomic_ref<uint32_t>(*flink).load(std::memory_order_acquire) != kXObjSignatureStored) {
+    return object_ref<XObject>();
+  }
+  uint32_t handle = header->wait_list_blink;
+  return kernel_state->object_table()->LookupObject<XObject>(handle);
+}
+
+}  // namespace
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -187,6 +261,12 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
 }
 
 uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+  if (REXCVAR_GET(wait_timeout_round_up)) {
+    // NT never ends a timed wait early: round up, saturate below INFINITE,
+    // and measure absolute timeouts against the guest system time.
+    const uint64_t now = timeout_ticks > 0 ? chrono::Clock::QueryGuestSystemTime() : 0;
+    return rex::thread::NtTimeoutToMillis(timeout_ticks, now);
+  }
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.
     // TODO(benvanik): convert time to relative time.
@@ -362,7 +442,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
 
   // Stash pointer in struct.
   // FIXME: This assumes the object has a dispatch header (some don't!)
-  StashHandle(header, handle());
+  StashHandleOrdered(header, handle());
 
   guest_object_ptr_ = native_ptr;
 }
@@ -379,6 +459,14 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   // each time.
   // We identify this by setting wait_list_flink to a magic value. When set,
   // wait_list_blink will hold a handle to our object.
+
+  if (util::ObjectLookupFastPathEnabled()) {
+    auto object =
+        LookupStashedObjectFast(kernel_state, reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr));
+    if (object) {
+      return object;
+    }
+  }
 
   auto global_lock = rex::thread::global_critical_region::AcquireDirect();
 
@@ -399,6 +487,12 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   } else {
     // First use, create new.
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
+    // The XObject constructor publishes the object (AddHandle) before
+    // InitializeNative runs. With the lookup fast path on, hold T exclusive
+    // until the stash is written, so a stale handle that aliases the reused
+    // slot can't reach a half-built object without G (Agent 12, ask 1).
+    // Lock order G -> T; nothing in this region calls Release.
+    ObjectTableExclusiveScope publish_scope;
     XObject* object = nullptr;
     switch (as_type) {
       case 0:  // EventNotificationObject
@@ -442,7 +536,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
 
     // Stash pointer in struct.
     // FIXME: This assumes the object contains a dispatch header (some don't!)
-    StashHandle(header, object->handle());
+    StashHandleOrdered(header, object->handle());
 
     return object_ref<XObject>(object);
   }

@@ -8,10 +8,17 @@
 
 #include <rex/platform.h>
 #include <rex/thread.h>
+#include <rex/threading_timeout.h>
+#include <rex/threading_suspend.h>
+#include <rex/threading_timing.h>
 
 static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
+
+#include <algorithm>
+#include <atomic>
+#include <limits>
 
 #include <spdlog/spdlog.h>
 
@@ -101,18 +108,89 @@ void Sleep(std::chrono::microseconds duration) {
   }
 }
 
-void SleepPrecise(std::chrono::microseconds duration) {
-  // One timer per thread, created on first use. The flag needs Windows 10
-  // 1803; older systems (and a failed create) fall back to the plain Sleep.
-  thread_local HANDLE timer = CreateWaitableTimerExW(
-      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-  if (!timer) {
-    Sleep(duration);
-    return;
+namespace {
+
+// Period of the timeBeginPeriod() request this process holds, 0 if none.
+std::atomic<uint32_t> timer_period_ms_{0};
+
+// PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION and the ProcessPowerThrottling
+// information class, spelled out so that older SDK headers also build.
+constexpr ULONG kPowerThrottlingIgnoreTimerResolution = 0x4;
+constexpr int kProcessPowerThrottlingClass = 4;
+
+using TimePeriodFn = UINT(WINAPI*)(UINT);
+
+// winmm is resolved at run time so the SDK gains no link dependency.
+TimePeriodFn GetTimePeriodFn(const char* name) {
+  static const HMODULE winmm =
+      LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!winmm) {
+    return nullptr;
   }
+  return reinterpret_cast<TimePeriodFn>(
+      reinterpret_cast<void (*)()>(GetProcAddress(winmm, name)));
+}
+
+// Windows 11 ignores the timer resolution a process requested while its
+// windows are minimized or occluded (EcoQoS); ask it to always honour ours.
+bool KeepTimerResolutionInBackground() {
+  struct PowerThrottlingState {  // PROCESS_POWER_THROTTLING_STATE
+    ULONG Version;
+    ULONG ControlMask;
+    ULONG StateMask;
+  };
+  using SetProcessInformationFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+  HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+  auto set_process_information =
+      kernel ? reinterpret_cast<SetProcessInformationFn>(reinterpret_cast<void (*)()>(
+                   GetProcAddress(kernel, "SetProcessInformation")))
+             : nullptr;
+  if (!set_process_information) {
+    return false;
+  }
+  PowerThrottlingState state = {};
+  state.Version = 1;  // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+  state.ControlMask = kPowerThrottlingIgnoreTimerResolution;
+  state.StateMask = 0;  // Controlled and off: never ignore our request.
+  return set_process_information(GetCurrentProcess(), kProcessPowerThrottlingClass, &state,
+                                 sizeof(state)) != FALSE;
+}
+
+// One high-resolution waitable timer per thread for precise sleeps, created
+// on first use and closed at thread exit. Null before Windows 10 1803 (no
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) or if creation fails.
+struct ThreadSleepTimer {
+  HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+  ThreadSleepTimer() = default;
+  ThreadSleepTimer(const ThreadSleepTimer&) = delete;
+  ThreadSleepTimer& operator=(const ThreadSleepTimer&) = delete;
+  ~ThreadSleepTimer() {
+    if (handle) {
+      CloseHandle(handle);
+    }
+  }
+};
+
+HANDLE GetThreadSleepTimer() {
+  thread_local ThreadSleepTimer timer;
+  return timer.handle;
+}
+
+// Arms the (synchronization) timer to signal once, `duration` from now.
+bool ArmSleepTimer(HANDLE timer, std::chrono::microseconds duration) {
+  constexpr int64_t kMaxMicros = std::numeric_limits<int64_t>::max() / 10;
   LARGE_INTEGER due;
-  due.QuadPart = -int64_t(duration.count()) * 10;  // Relative, 100 ns units.
-  if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+  due.QuadPart = -std::clamp<int64_t>(duration.count(), 0, kMaxMicros) * 10;  // Relative, 100 ns.
+  return SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) != FALSE;
+}
+
+}  // namespace
+
+void SleepPrecise(std::chrono::microseconds duration) {
+  // Without a high-resolution timer, fall back to the plain Sleep.
+  HANDLE timer = GetThreadSleepTimer();
+  if (!timer || !ArmSleepTimer(timer, duration)) {
     Sleep(duration);
     return;
   }
@@ -124,6 +202,80 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
     return SleepResult::kAlerted;
   }
   return SleepResult::kSuccess;
+}
+
+SleepResult AlertableSleepPrecise(std::chrono::microseconds duration) {
+  if (duration.count() <= 0) {
+    return AlertableSleep(std::chrono::microseconds(0));
+  }
+  HANDLE timer = GetThreadSleepTimer();
+  if (!timer || !ArmSleepTimer(timer, duration)) {
+    // Whole milliseconds, rounded up so that the sleep never ends early.
+    auto ms = std::chrono::ceil<std::chrono::milliseconds>(duration);
+    return AlertableSleep(std::min(ms, std::chrono::milliseconds(kMaxFiniteWaitMillis)));
+  }
+  if (WaitForSingleObjectEx(timer, INFINITE, TRUE) == WAIT_IO_COMPLETION) {
+    // User APCs ran and ended the sleep. A late signal is harmless: arming
+    // the timer again resets it.
+    CancelWaitableTimer(timer);
+    return SleepResult::kAlerted;
+  }
+  return SleepResult::kSuccess;
+}
+
+void ConfigureHostTiming(const HostTimingConfig& config) {
+  bool background_optout = false;
+  if (config.keep_timer_resolution_in_background) {
+    background_optout = KeepTimerResolutionInBackground();
+    if (!background_optout) {
+      // Expected before Windows 11, which introduced the flag.
+      spdlog::debug("Timer resolution power throttling opt-out failed (0x{:08X})", GetLastError());
+    }
+  }
+  const uint32_t period = config.timer_resolution_ms;
+  if (!period) {
+    return;
+  }
+  auto time_begin_period = GetTimePeriodFn("timeBeginPeriod");
+  auto time_end_period = GetTimePeriodFn("timeEndPeriod");
+  if (!time_begin_period || !time_end_period || time_begin_period(period) != 0) {
+    spdlog::warn("Could not set the host timer resolution to {} ms", period);
+    return;
+  }
+  uint32_t expected = 0;
+  if (!timer_period_ms_.compare_exchange_strong(expected, period)) {
+    time_end_period(period);  // A request is already held; keep only one.
+  }
+  // The A/B harness greps for this line. NtQueryTimerResolution can't confirm
+  // it: it reports the system-wide value, and since Windows 10 2004 another
+  // process's request no longer applies to this process.
+  spdlog::info("Host timer resolution set to {} ms (background opt-out {})", period,
+               background_optout ? "on" : "off");
+}
+
+void RestoreHostTiming() {
+  const uint32_t period = timer_period_ms_.exchange(0);
+  if (!period) {
+    return;
+  }
+  if (auto time_end_period = GetTimePeriodFn("timeEndPeriod")) {
+    time_end_period(period);
+  }
+}
+
+bool WaitUntilSuspended(Thread* thread) {
+  if (!thread) {
+    return false;
+  }
+  auto handle = static_cast<HANDLE>(thread->native_handle());
+  if (!handle) {
+    return false;
+  }
+  // SuspendThread only queues the suspension. GetThreadContext returns once
+  // the thread has really stopped.
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL;
+  return GetThreadContext(handle, &context) != FALSE;
 }
 
 TlsHandle AllocateTlsHandle() {
@@ -360,6 +512,9 @@ class Win32Timer : public Win32Handle<Timer> {
   std::function<void()> callback_;
 };
 
+// These stay standard waitable timers: SetWaitableTimer rejects a completion
+// routine on a CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer with
+// ERROR_INVALID_PARAMETER, and Win32Timer passes one whenever a callback is set.
 std::unique_ptr<Timer> Timer::CreateManualResetTimer() {
   HANDLE handle = CreateWaitableTimer(NULL, TRUE, NULL);
   if (handle) {

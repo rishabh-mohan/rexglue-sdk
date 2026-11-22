@@ -20,6 +20,10 @@
 
 namespace rex::codegen {
 
+// Guest tail-call emission, defined in context.cpp (RecompilerConfig::musttailCalls).
+void emit_tail_call(BuilderContext& ctx, uint32_t address);
+void emit_tail_call_line(BuilderContext& ctx, std::string_view indent, std::string_view name);
+
 //=============================================================================
 // Unconditional Branch
 //=============================================================================
@@ -40,8 +44,7 @@ bool build_b(BuilderContext& ctx) {
     case TargetKind::Function:
     case TargetKind::Import:
       // Tail call to another function or import
-      ctx.emit_function_call(target);
-      ctx.println("\treturn;");
+      emit_tail_call(ctx, target);
       break;
 
     case TargetKind::Unknown:
@@ -50,8 +53,7 @@ bool build_b(BuilderContext& ctx) {
         ctx.println("\tgoto loc_{:X};", target);
       } else {
         REXCODEGEN_WARN("Unresolved b target 0x{:08X} from 0x{:08X}", target, ctx.base);
-        ctx.emit_function_call(target);
-        ctx.println("\treturn;");
+        emit_tail_call(ctx, target);
       }
       break;
   }
@@ -62,7 +64,7 @@ bool build_bl(BuilderContext& ctx) {
   uint32_t target = ctx.insn.operands[0];
 
   // Always set LR (unless skipLr)
-  if (!ctx.config().skipLr)
+  if (ctx.trackLr())
     ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
 
   // Use graph to classify the target
@@ -99,7 +101,7 @@ bool build_blr(BuilderContext& ctx) {
 bool build_blrl(BuilderContext& ctx) {
   // BLRL: save return address, then branch-and-link to current LR
   ctx.println("\t{{ auto old_lr = ctx.lr;");
-  if (!ctx.config().skipLr)
+  if (ctx.trackLr())
     ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
   ctx.println("\tREX_CALL_INDIRECT_FUNC(uint32_t(old_lr)); }}");
   ctx.csrState = CSRState::Unknown;
@@ -146,8 +148,9 @@ bool build_bctr(BuilderContext& ctx) {
         case TargetKind::Function:
         case TargetKind::Import:
           if (auto* targetFn = ctx.graph().getFunction(label)) {
+            ctx.check_register_handoff(label);
             ctx.emitCtx.reference(targetFn->name());
-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
+            emit_tail_call_line(ctx, "\t\t", targetFn->name());
           } else {
             REXCODEGEN_ERROR(
                 "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
@@ -156,8 +159,8 @@ bool build_bctr(BuilderContext& ctx) {
                 "\t\tREX_FATAL(\"Jump target 0x{:08X} classified as function but not "
                 "in graph at bctr 0x{:08X}\");",
                 label, ctx.base);
+            ctx.println("\t\treturn;");
           }
-          ctx.println("\t\treturn;");
           break;
         default:
           REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);
@@ -184,7 +187,7 @@ bool build_bctr(BuilderContext& ctx) {
 }
 
 bool build_bctrl(BuilderContext& ctx) {
-  if (!ctx.config().skipLr)
+  if (ctx.trackLr())
     ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
   ctx.println("\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
   ctx.csrState = CSRState::Unknown;  // the call could change it

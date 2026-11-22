@@ -102,13 +102,20 @@ void AnalyzeTestBinary(CodegenContext& ctx, std::string_view testName,
       uint32_t raw = load_and_swap<uint32_t>(data + (fnAddr - baseAddress) + offset);
       auto decoded = decode_instruction(pc, raw);
 
-      // Check for bl (branch with link = function call)
-      if (decoded.is_call() && decoded.branch_target.has_value()) {
-        uint32_t target = decoded.branch_target.value();
-        auto* targetNode = ctx.graph.getFunction(target);
-        if (targetNode) {
-          ctx.graph.addCallToFunction(fnAddr, pc, CallTarget::function(targetNode));
-        }
+      // A bl to a test function is a call. A b or bc to another test function
+      // is a tail call. The builders resolve both through the function's call
+      // and tail-call edges (BuilderContext::findCallTarget), and emit
+      // REX_FATAL for a branch to a function entry without one.
+      if (!decoded.branch_target.has_value())
+        continue;
+      uint32_t target = decoded.branch_target.value();
+      auto* targetNode = ctx.graph.getFunction(target);
+      if (!targetNode)
+        continue;
+      if (decoded.is_call()) {
+        ctx.graph.addCallToFunction(fnAddr, pc, CallTarget::function(targetNode));
+      } else if (target < fnAddr || target >= nextAddr) {
+        ctx.graph.addTailCallToFunction(fnAddr, pc, CallTarget::function(targetNode));
       }
     }
   }

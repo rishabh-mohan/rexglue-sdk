@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstdlib>
+
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -28,10 +30,15 @@ void HalReturnToFirmware_entry(u32 routine) {
   // Routine must be 1 'HalRebootRoutine'
   assert_true(routine == 1);
 
-  // TODO(benvank): diediedie much more gracefully
-  // Not sure how to blast back up the stack in LLVM without exceptions, though.
+  // There is no dashboard to return to, so hard-exit the way ReXApp::OnClosing
+  // does: flush the logs, then std::_Exit. CRT exit() would run the EXE's
+  // atexit handlers and static destructors on this guest thread while the
+  // other threads keep running. OnShutdown would tear down the runtime this
+  // thread runs on, and KernelState::TerminateTitle() never returns to a guest
+  // caller, so neither is used.
   REXKRNL_ERROR("Game requested shutdown via HalReturnToFirmware");
-  exit(0);
+  rex::FlushLogging();
+  std::_Exit(0);
 }
 
 }  // namespace rex::kernel::xboxkrnl

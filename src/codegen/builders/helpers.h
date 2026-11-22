@@ -65,6 +65,14 @@ inline bool isRecordForm(const ppc_insn& insn) {
 }
 
 /**
+ * XER operand of a CR compare: "{}" (SO = 0) when cr_compare_so_zero proved
+ * that no XER.SO writer reaches this function, else the XER register.
+ */
+inline const char* compareXer(BuilderContext& ctx) {
+  return ctx.compareSoZero ? "{}" : ctx.xer();
+}
+
+/**
  * Emit CR0 comparison for record-form instructions.
  *
  * Record-form instructions (those with '.' suffix like add., and., etc.)
@@ -79,7 +87,7 @@ inline bool isRecordForm(const ppc_insn& insn) {
 inline void emitRecordFormCompare(BuilderContext& ctx) {
   if (isRecordForm(ctx.insn)) {
     ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
-                ctx.xer());
+                compareXer(ctx));
   }
 }
 
@@ -142,7 +150,8 @@ inline void emitCRBitOperation(BuilderContext& ctx, std::string_view op, bool in
  */
 inline void emitCompareRegister(BuilderContext& ctx, const char* type_name, const char* field) {
   ctx.println("\t{}.compare<{}>({}.{}, {}.{}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
-              ctx.r(ctx.insn.operands[1]), field, ctx.r(ctx.insn.operands[2]), field, ctx.xer());
+              ctx.r(ctx.insn.operands[1]), field, ctx.r(ctx.insn.operands[2]), field,
+              compareXer(ctx));
 }
 
 /**
@@ -161,10 +170,10 @@ inline void emitCompareImmediate(BuilderContext& ctx, const char* type_name, con
   if (sign_extend) {
     ctx.println("\t{}.compare<{}>({}.{}, {}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
                 ctx.r(ctx.insn.operands[1]), field, static_cast<int32_t>(ctx.insn.operands[2]),
-                ctx.xer());
+                compareXer(ctx));
   } else {
     ctx.println("\t{}.compare<{}>({}.{}, {}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
-                ctx.r(ctx.insn.operands[1]), field, ctx.insn.operands[2], ctx.xer());
+                ctx.r(ctx.insn.operands[1]), field, ctx.insn.operands[2], compareXer(ctx));
   }
 }
 
@@ -309,7 +318,10 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
       "{}.{}, {}({}.{}));",
       ctx.cr(0), ptr_type, ctx.ea(), ctx.reserved(), field, bswap_func, ctx.r(ctx.insn.operands[0]),
       field);
-  ctx.println("\t{}.so = {}.so;", ctx.cr(0), ctx.xer());
+  if (ctx.compareSoZero)
+    ctx.println("\t{}.so = 0;", ctx.cr(0));
+  else
+    ctx.println("\t{}.so = {}.so;", ctx.cr(0), ctx.xer());
 }
 
 //=============================================================================

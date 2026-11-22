@@ -10,6 +10,7 @@
  */
 
 #include "builder_context.h"
+#include "flush_mode.h"
 #include "helpers.h"
 
 namespace rex::codegen {
@@ -19,21 +20,21 @@ namespace rex::codegen {
 //=============================================================================
 
 bool build_fabs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println("\t{}.u64 = {}.u64 & ~0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fnabs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println("\t{}.u64 = {}.u64 | 0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fneg(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
@@ -44,13 +45,13 @@ bool build_fneg(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_fmr(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println("\t{}.f64 = {}.f64;", ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fcfid(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println("\t{}.f64 = double({}.s64);", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
@@ -67,7 +68,7 @@ bool build_fctid(BuilderContext& ctx) {
 }
 
 bool build_fctidz(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println(
       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
       "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
@@ -87,7 +88,7 @@ bool build_fctiw(BuilderContext& ctx) {
 }
 
 bool build_fctiwz(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
+  emitFlushModeUnlessIndependent(ctx, false);
   ctx.println(
       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
       "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 
 #include <fmt/format.h>
 
@@ -35,13 +36,29 @@
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <rex/threading_suspend.h>
+#include <rex/threading_timeout.h>
+#include <rex/threading_timing.h>
 #include <rex/vec128.h>
+
+REXCVAR_DEFINE_BOOL(guest_suspend_guard, false, "Kernel",
+                    "Suspending another guest thread holds the global critical region until that "
+                    "thread has actually stopped, so it can't stop while holding the lock (avoids "
+                    "a possible hang on unpause). Always on with object_lookup_fast_path");
 
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
+
+REXCVAR_DEFINE_BOOL(precise_guest_sleep, false, "Kernel",
+                    "KeDelayExecutionThread: sleep the exact time (rounded up) on a "
+                    "high-resolution timer and honour absolute times");
+
+REXCVAR_DEFINE_BOOL(tls_bounds_fix, false, "Kernel",
+                    "Thread TLS: allocate whole groups of 4 slots (as the process slot bitmap "
+                    "does) and reject slot indices past the end of the slot area");
 
 namespace rex::system {
 
@@ -357,6 +374,11 @@ X_STATUS XThread::Create() {
   if (tls_header && tls_header->slot_count) {
     tls_slots = tls_header->slot_count;
     tls_extended_size = tls_header->data_size;
+  }
+  if (REXCVAR_GET(tls_bounds_fix)) {
+    // Whole groups of 4 slots: KernelState::SetProcessTLSVars pads the process
+    // slot bitmap the same way, so KeTlsAlloc can return the padding slots.
+    tls_slots = (tls_slots + 3) & ~3u;
   }
 
   // Allocate both the slots and the extended data.
@@ -904,7 +926,14 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
 }
 
 bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-  if (slot * 4 > tls_total_size_) {
+  if (REXCVAR_GET(tls_bounds_fix)) {
+    // The slots follow the extended data in the block (see Create()); 64-bit
+    // arithmetic so that a huge slot cannot wrap around into range.
+    const uint32_t slot_bytes = tls_total_size_ - (tls_dynamic_address_ - tls_static_address_);
+    if (uint64_t(slot) * 4 + 4 > slot_bytes) {
+      return false;
+    }
+  } else if (slot * 4 > tls_total_size_) {
     return false;
   }
 
@@ -914,7 +943,12 @@ bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
 }
 
 bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
-  if (slot * 4 >= tls_total_size_) {
+  if (REXCVAR_GET(tls_bounds_fix)) {
+    const uint32_t slot_bytes = tls_total_size_ - (tls_dynamic_address_ - tls_static_address_);
+    if (uint64_t(slot) * 4 + 4 > slot_bytes) {
+      return false;
+    }
+  } else if (slot * 4 >= tls_total_size_) {
     return false;
   }
 
@@ -970,6 +1004,14 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
 #endif
 }
 
+namespace util {
+// Defined in object_table.cpp. Declared here because object_table.h is part of
+// the generated-code PCH.
+bool ObjectLookupFastPathEnabled();
+void LockObjectTableForSuspend();
+void UnlockObjectTableForSuspend();
+}  // namespace util
+
 X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   uint8_t previous_suspend_count =
@@ -982,6 +1024,21 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   // Wrapped to 0 - treat as not suspended.
   if (guest_thread->suspend_count == 0) {
     return X_STATUS_SUCCESS;
+  }
+  if ((REXCVAR_GET(guest_suspend_guard) || util::ObjectLookupFastPathEnabled()) &&
+      !IsInThread(this)) {
+    // SuspendThread is asynchronous. Hold the global critical region, and the
+    // handle table lock, until the thread has really stopped, so it can't stop
+    // while holding either one (perf-notes/agent11-global-mutex-design.md,
+    // part B). Not for self-suspension: that would stop us holding them.
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    util::LockObjectTableForSuspend();
+    const bool suspended = thread_->Suspend(&unused_host_suspend_count);
+    if (suspended) {
+      rex::thread::WaitUntilSuspended(thread_.get());
+    }
+    util::UnlockObjectTableForSuspend();
+    return suspended ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
   }
   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
 }
@@ -997,8 +1054,45 @@ uint32_t XThread::SelfSuspend() {
 }
 #endif
 
+// Guest to host duration like Clock::ScaleGuestDurationMillis, but in 100 ns
+// units so that the sub-millisecond part survives; saturates on overflow.
+static uint64_t ScaleGuestRelative100ns(uint64_t guest_100ns) {
+  const double scalar = chrono::Clock::guest_time_scalar();
+  if (!guest_100ns || scalar == 1.0 || REXCVAR_GET(clock_no_scaling)) {
+    return guest_100ns;
+  }
+  const double host_100ns = static_cast<double>(guest_100ns) * scalar;
+  return host_100ns < 1.8e19 ? static_cast<uint64_t>(host_100ns)
+                              : std::numeric_limits<uint64_t>::max();
+}
+
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
   int64_t timeout_ticks = interval;
+  if (REXCVAR_GET(precise_guest_sleep)) {
+    // NT semantics: never wake early (round up to whole microseconds and
+    // sleep on a high-resolution timer), and a positive interval is an
+    // absolute guest system time, not "now".
+    const uint64_t now = timeout_ticks > 0 ? chrono::Clock::QueryGuestSystemTime() : 0;
+    const auto duration = std::chrono::microseconds(
+        static_cast<int64_t>(rex::thread::Relative100nsToMicros(ScaleGuestRelative100ns(
+            rex::thread::NtTimeoutToRelative100ns(timeout_ticks, now)))));
+    CheckTitleTermination();
+    if (alertable) {
+      auto result = rex::thread::AlertableSleepPrecise(duration);
+      CheckTitleTermination();
+      return result == rex::thread::SleepResult::kAlerted ? X_STATUS_USER_APC : X_STATUS_SUCCESS;
+    }
+    if (duration.count()) {
+      rex::thread::SleepPrecise(duration);
+    } else if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
+      rex::thread::Sleep(std::chrono::microseconds(100));
+    } else {
+      rex::thread::MaybeYield();
+    }
+    CheckTitleTermination();
+    return X_STATUS_SUCCESS;
+  }
+
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.

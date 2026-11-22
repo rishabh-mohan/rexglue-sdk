@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <cstring>
+#include <thread>
+
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
@@ -40,11 +44,61 @@ REXCVAR_DEFINE_INT32(
 // and let the normal AudioSystem handling take it, to prevent duplicate
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
+REXCVAR_DEFINE_BOOL(
+    audio_shutdown_detach_worker, false, "Audio",
+    "If the audio worker has not exited when shutdown times out, wait up to 2 s more, then "
+    "leave it running and leak what it can still reach instead of force-terminating it "
+    "(TerminateThread can leave the global lock held, so later shutdown steps never finish). "
+    "Off: force-terminate after the timeout (old).");
+
 namespace rex::audio {
 
 namespace {
 constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+// Detach mode only: after the timeout, how long Shutdown() keeps waiting for the worker to
+// exit by itself (a slow guest callback usually returns) before detaching it. A detached
+// worker that resumes guest code later would run it during the runtime teardown.
+constexpr std::chrono::milliseconds kWorkerExitGrace{2000};
+// Detach mode only: how long Shutdown() then waits for the worker to be in a blocking call
+// (it is inside only for short, non-blocking stretches) before detaching it anyway.
+constexpr std::chrono::milliseconds kWorkerDetachGrace{2000};
 }  // namespace
+
+// Detach mode (audio_shutdown_detach_worker): the worker runs every blocking call (WaitAny,
+// the global lock, guest callbacks, sleeps) "outside", touching no member of the AudioSystem,
+// and the short stretches between them "inside". Shutdown() detaches the worker only while it
+// is outside; the worker's next Reenter() then fails and it parks forever, never touching the
+// AudioSystem again. Process exit reaps it. Nothing it can still use is freed (see Shutdown).
+struct AudioSystem::WorkerControl {
+  enum : uint32_t { kInside = 0, kOutside = 1, kDetached = 2 };
+  std::atomic<uint32_t> phase{kInside};
+
+  // Worker: about to block. Parks if Shutdown() force-detached it meanwhile.
+  void Leave() {
+    uint32_t expected = kInside;
+    if (!phase.compare_exchange_strong(expected, kOutside)) {
+      Park();
+    }
+  }
+  // Worker: back from a blocking call. False if Shutdown() detached it meanwhile.
+  bool Reenter() {
+    uint32_t expected = kOutside;
+    return phase.compare_exchange_strong(expected, kInside);
+  }
+  // Shutdown(): succeeds only while the worker is outside.
+  bool TryDetach() {
+    uint32_t expected = kOutside;
+    return phase.compare_exchange_strong(expected, kDetached);
+  }
+  void ForceDetach() { phase.store(kDetached); }
+
+  // Holds no lock and is not alertable, so no guest code runs on the parked worker.
+  [[noreturn]] static void Park() {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::hours(1));
+    }
+  }
+};
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -83,10 +137,17 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
     return result;
   }
 
+  if (REXCVAR_GET(audio_shutdown_detach_worker)) {
+    worker_control_ = std::make_shared<WorkerControl>();
+  }
+  WorkerControl* ctl = worker_control_.get();
+
   worker_running_ = true;
-  worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state, 128 * 1024, 0, [this]() {
-        WorkerThreadMain();
+  // The lambda (owned by the XHostThread) keeps the control block alive for a detached worker.
+  worker_thread_ = system::object_ref<system::XHostThread>(new system::XHostThread(
+      kernel_state, 128 * 1024, 0, [this, ctl, keep = worker_control_]() {
+        (void)keep;
+        WorkerThreadMain(ctl);
         return 0;
       }));
 
@@ -96,7 +157,20 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
   return X_STATUS_SUCCESS;
 }
 
-void AudioSystem::WorkerThreadMain() {
+void AudioSystem::WorkerThreadMain(WorkerControl* ctl) {
+  // ctl is null unless audio_shutdown_detach_worker is on; then leave()/reenter() bracket every
+  // blocking call (see WorkerControl). With the cvar off both are no-ops.
+  const auto leave = [ctl] {
+    if (ctl) {
+      ctl->Leave();
+    }
+  };
+  const auto reenter = [ctl] {
+    if (ctl && !ctl->Reenter()) {
+      WorkerControl::Park();
+    }
+  };
+
   // Initialize driver and ringbuffer.
   Initialize();
 
@@ -106,8 +180,14 @@ void AudioSystem::WorkerThreadMain() {
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
-    auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
+    // Local copy: the wait must not read members while outside. The handles themselves
+    // are never freed while a detached worker can still wait on them.
+    rex::thread::WaitHandle* wait_handles[kMaximumClientCount + 1];
+    std::memcpy(wait_handles, wait_handles_, sizeof(wait_handles));
+    leave();
+    auto result = rex::thread::WaitAny(wait_handles, rex::countof(wait_handles), true,
                                        std::chrono::milliseconds(500));
+    reenter();
     if (result.first == rex::thread::WaitResult::kFailed) {
       REXAPU_WARN("AudioWorker: WaitAny failed");
       continue;
@@ -123,7 +203,10 @@ void AudioSystem::WorkerThreadMain() {
       // Shutdown event signaled.
       if (paused_) {
         pause_fence_.Signal();
-        thread::Wait(resume_event_.get(), false);
+        rex::thread::Event* resume_event = resume_event_.get();
+        leave();
+        thread::Wait(resume_event, false);
+        reenter();
       }
 
       continue;
@@ -134,7 +217,13 @@ void AudioSystem::WorkerThreadMain() {
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
-      auto global_lock = global_critical_region_.Acquire();
+      // Same static mutex as global_critical_region_.Acquire(), taken while outside.
+      leave();
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      if (ctl && !ctl->Reenter()) {
+        global_lock.unlock();
+        WorkerControl::Park();
+      }
       uint32_t client_callback = clients_[index].callback;
       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
       global_lock.unlock();
@@ -146,8 +235,11 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
-        function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
-                                      rex::countof(args));
+        runtime::FunctionDispatcher* dispatcher = function_dispatcher_;
+        auto* thread_state = worker_thread_->thread_state();
+        leave();
+        dispatcher->Execute(thread_state, client_callback, args, rex::countof(args));
+        reenter();
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }
@@ -165,10 +257,14 @@ void AudioSystem::WorkerThreadMain() {
 
     if (!pumped) {
       SCOPE_profile_cpu_i("apu", "Sleep");
+      leave();
       rex::thread::Sleep(std::chrono::milliseconds(500));
+      reenter();
     }
   }
   worker_running_ = false;
+  // Nothing after this touches the AudioSystem (XHostThread::Exit uses only the XThread).
+  leave();
 
   // TODO(benvanik): call module API to kill?
 }
@@ -197,7 +293,14 @@ void AudioSystem::Shutdown() {
   }
 
   worker_running_ = false;
+  const bool detach_mode = worker_control_ != nullptr;
+  if (detach_mode && paused_) {
+    // A paused worker sits in the resume wait and never sees the shutdown event; wake it
+    // so it can exit normally instead of timing out (detach mode only).
+    resume_event_->Set();
+  }
   shutdown_event_->Set();
+  bool detached = false;
   if (worker_thread_) {
     // The worker may be stuck inside a guest callback that is itself blocked on
     // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
@@ -207,11 +310,38 @@ void AudioSystem::Shutdown() {
     bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
                                      rex::thread::WaitResult::kSuccess;
     if (!exited) {
-      REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
-                  kWorkerShutdownTimeout.count());
-      worker_thread_->Terminate(0);
+      if (detach_mode) {
+        // Never force-terminate: the worker may hold or wait for the global lock.
+        detached = host_thread && DetachWorker(host_thread);
+      } else {
+        REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
+                    kWorkerShutdownTimeout.count());
+        worker_thread_->Terminate(0);
+      }
     }
-    worker_thread_.reset();
+    if (detached) {
+      // Leak our reference: the still-running worker uses its XThread (thread state,
+      // stack) and the host_fn_ that owns the control block.
+      (void)worker_thread_.release();
+    } else {
+      worker_thread_.reset();
+    }
+  }
+
+  if (detached) {
+    // Free nothing the worker (or guest code it is running) can still reach: its wait
+    // handles, the client drivers (SubmitFrame) and the wrapped callback args. The
+    // clients_ entries stay as they are. Process exit reclaims all of it.
+    for (auto& semaphore : client_semaphores_) {
+      (void)semaphore.release();
+    }
+    (void)shutdown_event_.release();
+    (void)resume_event_.release();
+    REXAPU_WARN(
+        "Audio worker did not exit within {} ms; detached it and leaked its thread, client "
+        "drivers and wait handles instead of terminating it",
+        (kWorkerShutdownTimeout + kWorkerExitGrace).count());
+    return;
   }
 
   // Destroy all active client drivers (closes SDL audio devices, stopping
@@ -225,6 +355,32 @@ void AudioSystem::Shutdown() {
       clients_[i] = {nullptr, 0, 0, 0, false};
     }
   }
+}
+
+// Detach mode only. Returns true once the worker is detached (it will never touch this
+// object again), false if it exited meanwhile.
+bool AudioSystem::DetachWorker(rex::thread::Thread* host_thread) {
+  // Bounded cooperative wait first: a worker in a slow guest callback usually returns, sees
+  // worker_running_ == false and exits, and then the normal teardown runs.
+  if (rex::thread::Wait(host_thread, false, kWorkerExitGrace) ==
+      rex::thread::WaitResult::kSuccess) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + kWorkerDetachGrace;
+  while (!worker_control_->TryDetach()) {
+    // Inside: a short, non-blocking stretch of worker code. Poll until it blocks or exits.
+    if (rex::thread::Wait(host_thread, false, std::chrono::milliseconds(1)) ==
+        rex::thread::WaitResult::kSuccess) {
+      return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      worker_control_->ForceDetach();
+      REXAPU_ERROR("Audio worker stayed inside the audio system for {} ms; detached it anyway",
+                   kWorkerDetachGrace.count());
+      return true;
+    }
+  }
+  return true;
 }
 
 X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index) {

@@ -13,7 +13,13 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <immintrin.h>
+#else
+#include <thread>
+#endif
 
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/cvar.h>
@@ -40,6 +46,18 @@ REXCVAR_DEFINE_UINT32(
     "naming the lock and the thread holding it. 0 restores the original behaviour of waiting "
     "forever - which is why a lock that is never released showed up as a completely silent freeze "
     "with nothing at all in the log.");
+
+REXCVAR_DEFINE_BOOL(
+    cs_spin, false, "Kernel",
+    "Spin briefly before a contended guest critical section (RtlEnterCriticalSection) blocks in "
+    "the kernel: a CPU pause loop that retries the lock only when it reads free, for up to "
+    "cs_spin_ns or the guest's own spin count, whichever is longer. false restores the original "
+    "behaviour: no spin unless the guest set a spin count, and then a tight CAS loop.");
+REXCVAR_DEFINE_UINT32(
+    cs_spin_ns, 5000, "Kernel",
+    "With cs_spin: how long, in ns, a contended RtlEnterCriticalSection spins before it blocks. "
+    "A time bound rather than an iteration count, because a CPU pause costs about 2.4x more on a "
+    "P-core than on an E-core. 0 spins only for the guest's spin count.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -390,6 +408,45 @@ namespace {
 // Defined below, next to the other reporting helper.
 void DescribeCriticalSectionOwner(uint32_t owner_object);
 std::string GuestBacktrace(uint32_t stack_pointer);
+
+inline void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
+// cs_spin: bounded spin for a contended RtlEnterCriticalSection, run only when
+// a spin is configured (cs_spin_ns or the guest's spin count). Returns true once
+// it has taken the lock (lock_count -1 -> 0); the caller sets the owner. One CAS
+// first, then a CPU pause, a plain read, and the CAS again only when the read
+// shows the lock free, so a waiter does not keep pulling the cache line away
+// from the owner with locked operations. A lock handed off by Leave keeps
+// lock_count >= 0 until the woken waiter runs, so the CAS cannot barge past it.
+// The spin ends once cs_spin_ns of wall time (steady_clock, checked every 16
+// pauses) and the guest spin count are both used up; the caller then takes the
+// unchanged atomic_inc / kernel wait path.
+bool SpinForCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t spin_count) {
+  const uint32_t spin_ns = REXCVAR_GET(cs_spin_ns);
+  if (!spin_ns && !spin_count) {
+    return false;
+  }
+  if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+    return true;
+  }
+  const volatile int32_t* lock_count = &cs->lock_count;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin_ns);
+  for (uint32_t i = 1;; ++i) {
+    CpuRelax();
+    if (*lock_count == -1 && rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+      return true;
+    }
+    if (!(i & 15) && i >= spin_count && std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+  }
+}
 }  // namespace
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
@@ -404,6 +461,15 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
 
   // Spin loop
+  if (REXCVAR_GET(cs_spin)) {
+    if (SpinForCriticalSection(cs, spin_count)) {
+      // Acquired.
+      cs->owning_thread = cur_thread;
+      cs->recursion_count = 1;
+      return;
+    }
+    spin_count = 0;  // SpinForCriticalSection has used the guest spin count.
+  }
   while (spin_count--) {
     if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.

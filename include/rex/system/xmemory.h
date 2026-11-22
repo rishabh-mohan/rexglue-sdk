@@ -323,6 +323,10 @@ class PhysicalHeap : public BaseHeap {
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
                         bool unwatch_exact_range, bool unprotect = true);
+  // Lockless pre-check for TriggerCallbacks after a host write that bypassed
+  // protection: false means no page in the range was write-watched, so the
+  // write needs no callbacks. Call it after writing the data.
+  bool MayHaveWriteWatches(uint32_t virtual_address, uint32_t length) const;
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 

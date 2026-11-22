@@ -242,7 +242,7 @@ bool build_mfocrf(BuilderContext& ctx) {
 }
 
 bool build_mflr(BuilderContext& ctx) {
-  if (!ctx.config().skipLr)
+  if (ctx.trackLr())
     ctx.println("\t{}.u64 = ctx.lr;", ctx.r(ctx.insn.operands[0]));
   return true;
 }
@@ -310,7 +310,7 @@ bool build_mtctr(BuilderContext& ctx) {
 }
 
 bool build_mtlr(BuilderContext& ctx) {
-  if (!ctx.config().skipLr)
+  if (ctx.trackLr())
     ctx.println("\tctx.lr = {}.u64;", ctx.r(ctx.insn.operands[0]));
   return true;
 }

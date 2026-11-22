@@ -27,6 +27,7 @@
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <rex/threading_timing.h>
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
@@ -34,12 +35,22 @@ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data pat
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
 
+// Default off (session-2 batch rule); 1 / true is the recommended setting.
+REXCVAR_DEFINE_UINT32(host_timer_resolution_ms, 0, "Runtime",
+                      "Host timer resolution to request at startup, in ms (0 = OS default; "
+                      "1 recommended)");
+REXCVAR_DEFINE_BOOL(host_timer_throttling_optout, false, "Runtime",
+                    "Keep the host timer resolution while the window is minimized or occluded");
+
 REXCVAR_DECLARE(std::string, perf_log_csv);
 
 namespace rex {
 
 // Static instance for global access
 Runtime* Runtime::instance_ = nullptr;
+
+// The runtime that applied the host timing settings; it restores them.
+static Runtime* host_timing_owner_ = nullptr;
 
 Runtime* Runtime::instance() {
   return instance_;
@@ -124,6 +135,15 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   thread::EnableAffinityConfiguration();
 
   tool_mode_ = config.tool_mode;
+
+  // Host timer resolution, for the game but not tools.
+  if (!tool_mode_) {
+    thread::HostTimingConfig timing;
+    timing.timer_resolution_ms = REXCVAR_GET(host_timer_resolution_ms);
+    timing.keep_timer_resolution_in_background = REXCVAR_GET(host_timer_throttling_optout);
+    thread::ConfigureHostTiming(timing);
+    host_timing_owner_ = this;
+  }
 
   // Create memory system first
   memory_ = std::make_unique<memory::Memory>();
@@ -296,6 +316,10 @@ void Runtime::Shutdown() {
   file_system_.reset();
   memory_.reset();
 
+  if (host_timing_owner_ == this) {
+    thread::RestoreHostTiming();
+    host_timing_owner_ = nullptr;
+  }
   rex::perf::Profiler::Shutdown();
   setup_complete_ = false;
 }

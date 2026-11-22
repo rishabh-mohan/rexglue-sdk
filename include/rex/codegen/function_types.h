@@ -56,11 +56,51 @@ struct EmitContext {
   /// per-file declaration header, so a missed name is a compile error.
   std::unordered_set<std::string>* referenced = nullptr;
 
+  /// Register localization fallback; both null unless a localization option is
+  /// on. interiorEntries: entries reached with live registers (body= entries and
+  /// entries inside another function's blocks). registersInCtx: functions emitted
+  /// with every register in ctx - those entries, body owners, functions with a
+  /// direct edge or jump table into one, and the save/restore helpers.
+  const std::unordered_set<uint32_t>* interiorEntries = nullptr;
+  const std::unordered_set<uint32_t>* registersInCtx = nullptr;
+
+  /// Counts control transfers from a function with localized registers into an
+  /// interior entry (BuilderContext::check_register_handoff). The writer fails
+  /// write() before flushing any output when the count is not zero.
+  size_t* handoffErrors = nullptr;
+
+  /// cr_compare_so_zero: entries whose emitted body writes XER.SO (mtxer, or a
+  /// mid-asm hook that takes xer), and whether one of them keeps XER in ctx.
+  /// Null unless the option is on (see PrepareEmitAnalyses).
+  const std::unordered_set<uint32_t>* xerWriters = nullptr;
+  bool ctxXerWritten = false;
+
+  /// skip_lr: entries whose emitted body uses LR as data - a bclrl (blrl or a
+  /// conditional form), or a bl to a label inside the function (bl $+4; mflr).
+  /// They keep the LR writes and reads that skip_lr drops everywhere else.
+  /// Null unless skip_lr is on (see PrepareEmitAnalyses).
+  const std::unordered_set<uint32_t>* lrUsers = nullptr;
+
   void reference(std::string_view name) const {
     if (referenced)
       referenced->emplace(name);
   }
 };
+
+/// Storage for the analyses EmitContext points into. Must outlive emission.
+struct EmitAnalyses {
+  std::unordered_set<uint32_t> interiorEntries;
+  std::unordered_set<uint32_t> registersInCtx;
+  std::unordered_set<uint32_t> xerWriters;
+  std::unordered_set<uint32_t> lrUsers;
+};
+
+/// Runs the analyses that emitCtx.config enables (register localization
+/// fallback, skip_lr LR users, cr_compare_so_zero) for `functions`, the
+/// functions about to be emitted, and points emitCtx at the results. Defined
+/// in codegen_writer.cpp.
+void PrepareEmitAnalyses(EmitContext& emitCtx, const std::vector<const FunctionNode*>& functions,
+                         EmitAnalyses& storage);
 
 //=============================================================================
 // Authority Levels
