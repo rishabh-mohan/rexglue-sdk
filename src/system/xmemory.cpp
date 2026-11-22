@@ -42,6 +42,10 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
+// S4.7 fix (i), default off: see PhysicalHeap::Protect.
+REXCVAR_DEFINE_BOOL(physical_protect_hold_global_lock, false, "Memory",
+                    "Hold the global lock across both host protects in PhysicalHeap::Protect");
+
 namespace rex::memory {
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
@@ -2128,6 +2132,21 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
                            uint32_t* old_protect) {
   auto global_lock = global_critical_region_.Acquire();
+
+  // S4.7 fix (i), physical_protect_hold_global_lock (default off). TriggerCallbacks
+  // below takes global_lock by value and drops it on return. Without this hold, an
+  // EnableAccessCallbacks on another thread can run between that invalidation and
+  // the host protects below: it watches the page and makes it read-only, then the
+  // host protect makes it writable again, so the watch bit stays set but the page
+  // never faults (EnableAccessCallbacks skips pages already watched). This second,
+  // recursive hold keeps the global critical region locked until return, error
+  // path included. Lock order is unchanged: without kMemoryProtectWrite, global_lock
+  // is already held across parent_heap_->Protect and BaseHeap::Protect (global
+  // critical region before heap_mutex_).
+  std::unique_lock<std::recursive_mutex> hold_global_lock;
+  if ((protect & memory::kMemoryProtectWrite) && REXCVAR_GET(physical_protect_hold_global_lock)) {
+    hold_global_lock = global_critical_region_.Acquire();
+  }
 
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance.

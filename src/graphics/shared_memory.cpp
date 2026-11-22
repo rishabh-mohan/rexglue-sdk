@@ -16,10 +16,23 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+// S4 P2 (default off). When on, MakeRangeValid holds the global critical region
+// once over the valid-bit update and the write-watch re-arm, and
+// RangeWrittenByGpu holds it once over FireWatches and MakeRangeValid. The inner
+// acquires (the scope in MakeRangeValid, FireWatches, EnableAccessCallbacks in
+// each view) become recursive re-entries, so G is released, and a waiter woken,
+// once per call instead of 4 (MakeRangeValid) or 5 (RangeWrittenByGpu) times.
+// Off: one cvar load and one untaken branch per call; the original code runs.
+REXCVAR_DEFINE_BOOL(shared_memory_single_hold_rearm, false, "GPU",
+                    "Hold the global lock once across a shared memory range's valid-bit "
+                    "update and its write-watch re-arm (fewer lock releases and waiter "
+                    "wakes on the GPU thread)");
 
 namespace rex::graphics {
 
@@ -283,6 +296,13 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
 
+  // S4 P2 (shared_memory_single_hold_rearm): one G hold for the watch firing and
+  // the re-arm. FireWatches and MakeRangeValid then acquire G recursively.
+  std::unique_lock<std::recursive_mutex> single_hold_lock;
+  if (REXCVAR_GET(shared_memory_single_hold_rearm)) {
+    single_hold_lock = global_critical_region_.Acquire();
+  }
+
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
@@ -310,6 +330,16 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_page_last = last >> page_size_log2_;
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
+
+  // S4 P2 (shared_memory_single_hold_rearm): hold G from the valid-bit update
+  // through EnablePhysicalMemoryAccessCallbacks below. The scope's acquire and
+  // the acquire in each view's EnableAccessCallbacks become recursive re-entries,
+  // so G is released once per call instead of 4 times. The memcpy that follows
+  // in UploadRanges still runs without G.
+  std::unique_lock<std::recursive_mutex> single_hold_lock;
+  if (REXCVAR_GET(shared_memory_single_hold_rearm)) {
+    single_hold_lock = global_critical_region_.Acquire();
+  }
 
   {
     auto global_lock = global_critical_region_.Acquire();

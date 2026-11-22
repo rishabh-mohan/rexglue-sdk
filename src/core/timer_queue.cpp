@@ -21,8 +21,18 @@
 #include <disruptorplus/spin_wait_strategy.hpp>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
+
+// Default off (behavior changes ship off until rated SAFE). perf-notes/agent11-kernel.md,
+// "S3 TimerQueue" (task #10), has the measurements and the tests.
+REXCVAR_DEFINE_BOOL(timer_queue_precise_wait, false, "Runtime",
+                    "Host timer thread: sleep until the next timer is due (a condition variable, "
+                    "then high-resolution sleeps). Off: the phased spin wait, which keeps a core "
+                    "about half busy with the 1 ms KeTimeStampBundle timer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace dp = disruptorplus;
 
@@ -39,7 +49,29 @@ class TimerWaitStrategy {
   // waking a stopped consumer must never make an uninitialized ring slot valid.
   struct Stopped {};
 
-  TimerWaitStrategy() : blocking_(std::getenv("REX_TIMER_WAIT_BLOCKING") != nullptr) {}
+  // kSpin: the default phased spin. kBlocking (REX_TIMER_WAIT_BLOCKING): the
+  // condition variable, whose timeouts end on an OS timer tick. kPrecise
+  // (timer_queue_precise_wait): the condition variable, then high-resolution
+  // sleeps for the last stretch before each deadline.
+  enum class Mode { kSpin, kBlocking, kPrecise };
+
+  TimerWaitStrategy()
+      : mode_(std::getenv("REX_TIMER_WAIT_BLOCKING") != nullptr ? Mode::kBlocking : Mode::kSpin) {}
+
+  // This queue starts during static initialization, before cvars are parsed.
+  // The first QueueTimer call, which startup makes after applying the command
+  // line, environment and config, picks the precise wait. The switch is one-way
+  // and precedes that call's publication: publishers read the mode after the
+  // call_once, and the consumer notifies only after consuming a later
+  // publication, so no notify a blocked waiter needs is ever skipped as kSpin.
+  void SelectMode() {
+    std::call_once(mode_selected_, [this] {
+      if (REXCVAR_GET(timer_queue_precise_wait)) {
+        mode_.store(Mode::kPrecise, std::memory_order_release);
+        REXLOG_INFO("TimerQueue: precise wait (timer_queue_precise_wait)");
+      }
+    });
+  }
 
   bool stopped() const { return stopped_.load(std::memory_order_acquire); }
 
@@ -54,7 +86,7 @@ class TimerWaitStrategy {
   dp::sequence_t wait_until_published(
       dp::sequence_t sequence, size_t count,
       const std::atomic<dp::sequence_t>* const sequences[]) {
-    if (!blocking_) {
+    if (spinning()) {
       ThrowIfStopped();
       dp::spin_wait spinner;
       auto result = dp::minimum_sequence_after(sequence, count, sequences);
@@ -81,7 +113,7 @@ class TimerWaitStrategy {
       dp::sequence_t sequence, size_t count,
       const std::atomic<dp::sequence_t>* const sequences[],
       const std::chrono::duration<Rep, Period>& timeout) {
-    if (!blocking_) {
+    if (spinning()) {
       return wait_until_published(sequence, count, sequences,
                                   std::chrono::high_resolution_clock::now() + timeout);
     }
@@ -94,7 +126,8 @@ class TimerWaitStrategy {
       dp::sequence_t sequence, size_t count,
       const std::atomic<dp::sequence_t>* const sequences[],
       const std::chrono::time_point<Clock, Duration>& deadline) {
-    if (!blocking_) {
+    const Mode mode = mode_.load(std::memory_order_acquire);
+    if (mode == Mode::kSpin) {
       ThrowIfStopped();
       dp::spin_wait spinner;
       auto result = dp::minimum_sequence_after(sequence, count, sequences);
@@ -117,6 +150,8 @@ class TimerWaitStrategy {
     // a platform timeout, which may overflow and turn an idle wait into a poll.
     if (deadline == std::chrono::time_point<Clock, Duration>::max()) {
       cv_.wait(lock, ready);
+    } else if (mode == Mode::kPrecise) {
+      WaitPrecise(lock, deadline, ready);
     } else {
       cv_.wait_until(lock, deadline, ready);
     }
@@ -125,7 +160,7 @@ class TimerWaitStrategy {
   }
 
   void signal_all_when_blocking() {
-    if (!blocking_) {
+    if (spinning()) {
       return;
     }
     // Publishers store their sequence before entering this lock. Taking the
@@ -135,11 +170,41 @@ class TimerWaitStrategy {
   }
 
  private:
+  // Condition variable timeouts end on an OS timer tick (15.625 ms unless the
+  // process raised the timer resolution), which fires a 1 ms timer in bursts.
+  // Wait on it until kPreciseWindow before the deadline, then sleep the rest in
+  // high-resolution slices of at most kPreciseSlice. A publication or Stop()
+  // during a slice is seen when the slice ends.
+  static constexpr std::chrono::milliseconds kPreciseWindow{20};
+  static constexpr std::chrono::microseconds kPreciseSlice{1000};
+
+  template <typename Clock, typename Duration, typename Ready>
+  void WaitPrecise(std::unique_lock<std::mutex>& lock,
+                   const std::chrono::time_point<Clock, Duration>& deadline, const Ready& ready) {
+    while (!ready()) {
+      const auto now = Clock::now();
+      if (now >= deadline) {
+        return;
+      }
+      if (deadline - now > kPreciseWindow) {
+        cv_.wait_until(lock, deadline - kPreciseWindow, ready);
+        continue;
+      }
+      const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - now);
+      lock.unlock();
+      SleepPrecise(std::min(remaining, kPreciseSlice));
+      lock.lock();
+    }
+  }
+
+  bool spinning() const { return mode_.load(std::memory_order_acquire) == Mode::kSpin; }
+
   void ThrowIfStopped() const {
     if (stopped()) throw Stopped{};
   }
 
-  const bool blocking_;
+  std::atomic<Mode> mode_;
+  std::once_flag mode_selected_;
   std::atomic<bool> stopped_{false};
   std::mutex mutex_;
   std::condition_variable cv_;
@@ -251,6 +316,8 @@ class TimerQueue {
     // The queue is permanently closed during teardown. Callers must still keep
     // the queue alive for the whole call; closure does not extend its lifetime.
     if (wait_strategy_.stopped()) return {};
+    // Before this call publishes: see TimerWaitStrategy::SelectMode.
+    wait_strategy_.SelectMode();
     auto wait_item_weak = std::weak_ptr<WaitItem>(wait_item);
 
     // Mitigate callback flooding

@@ -10,6 +10,7 @@
  */
 
 #include <cstring>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -25,7 +27,137 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// S4 u diagnostic (logging only, default off). When on, every successful
+// UploadRanges call hashes the guest pages it uploaded and compares each hash
+// with the one from that page's previous upload. One info line per frame that
+// had uploads. Off: UploadRanges runs its original code plus one cvar load and
+// one untaken branch per successful call.
+REXCVAR_DEFINE_BOOL(shared_memory_upload_hash_log, false, "GPU/D3D12",
+                    "Diagnostic: log per frame how many re-uploaded shared memory pages are "
+                    "byte-identical to their previous upload (costs one XXH3 pass over "
+                    "every uploaded byte on the GPU thread)");
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+
+// State of the shared_memory_upload_hash_log diagnostic. Only touched while the
+// cvar is on, and then always under the mutex.
+struct UploadHashLog {
+  // Keeping the write watch over a lock (S4 P1) turns guest writes into write
+  // watch faults, and a fault invalidates and unwatches the whole 256 KB block:
+  // the shared memory and primitive processor callbacks both widen non-exact
+  // ranges to 256 KB. The block counters estimate that.
+  static constexpr uint32_t kBlockSizeLog2 = 18;
+  static constexpr uint32_t kBlockCount = SharedMemory::kBufferSize >> kBlockSizeLog2;
+
+  std::mutex mutex;
+  uint32_t page_size_log2 = 0;
+  std::vector<uint64_t> page_hashes;  // per page, meaningful where page_hashed is set
+  std::vector<uint64_t> page_hashed;  // bit set: the page was hashed by an earlier upload
+  uint64_t frame = 0;
+  // Counters of the frame being collected.
+  uint32_t calls = 0, ranges = 0, pages = 0, pages_first = 0, pages_unchanged = 0;
+  uint64_t blocks_uploaded[kBlockCount / 64] = {};
+  uint64_t blocks_changed[kBlockCount / 64] = {};
+  uint32_t block_pages_rehashed[kBlockCount] = {};  // re-uploaded pages (not first) per block
+};
+UploadHashLog upload_hash_log;
+
+void UploadHashLogFlushFrame(UploadHashLog& log) {
+  if (log.pages) {
+    uint32_t pages_rehashed = log.pages - log.pages_first;
+    uint32_t blocks = 0, blocks_changed = 0, pages_in_changed_blocks = 0;
+    for (uint32_t block = 0; block < UploadHashLog::kBlockCount; ++block) {
+      uint64_t block_bit = uint64_t(1) << (block & 63);
+      if (log.blocks_uploaded[block >> 6] & block_bit) {
+        ++blocks;
+      }
+      if (log.blocks_changed[block >> 6] & block_bit) {
+        ++blocks_changed;
+        pages_in_changed_blocks += log.block_pages_rehashed[block];
+      }
+    }
+    // u_page: share of the re-uploaded pages that are byte-identical to their
+    // previous upload. u_block: share of the re-uploaded pages in 256 KB blocks
+    // with no changed page. -1 if the frame only had first uploads. Both are
+    // upper bounds for P1: an identical rewrite counts as unchanged here but
+    // still faults and re-uploads under P1.
+    double u_page = -1.0, u_block = -1.0;
+    if (pages_rehashed) {
+      u_page = double(log.pages_unchanged) / double(pages_rehashed);
+      u_block = 1.0 - double(pages_in_changed_blocks) / double(pages_rehashed);
+    }
+    REXGPU_INFO(
+        "S4 upload hash: frame {} calls {} ranges {} pages {} ({} KB) first {} unchanged {} "
+        "changed {} blocks {} changed_blocks {} pages_in_changed_blocks {} u_page {:.4f} "
+        "u_block {:.4f}",
+        log.frame, log.calls, log.ranges, log.pages,
+        (uint64_t(log.pages) << log.page_size_log2) >> 10, log.pages_first,
+        log.pages_unchanged, pages_rehashed - log.pages_unchanged, blocks, blocks_changed,
+        pages_in_changed_blocks, u_page, u_block);
+  }
+  log.calls = 0;
+  log.ranges = 0;
+  log.pages = 0;
+  log.pages_first = 0;
+  log.pages_unchanged = 0;
+  std::memset(log.blocks_uploaded, 0, sizeof(log.blocks_uploaded));
+  std::memset(log.blocks_changed, 0, sizeof(log.blocks_changed));
+  std::memset(log.block_pages_rehashed, 0, sizeof(log.block_pages_rehashed));
+}
+
+void UploadHashLogBeginCall(UploadHashLog& log, uint64_t frame, uint32_t page_size_log2) {
+  if (log.page_hashes.empty()) {
+    log.page_size_log2 = page_size_log2;
+    size_t page_count = size_t(SharedMemory::kBufferSize) >> page_size_log2;
+    log.page_hashes.assign(page_count, 0);
+    log.page_hashed.assign((page_count + 63) / 64, 0);
+  }
+  if (frame != log.frame) {
+    UploadHashLogFlushFrame(log);
+    log.frame = frame;
+  }
+  ++log.calls;
+}
+
+void UploadHashLogPages(UploadHashLog& log, const uint8_t* guest_pages, uint32_t page_first,
+                        uint32_t page_count) {
+  uint32_t page_total = uint32_t(log.page_hashes.size());
+  if (page_first >= page_total) {
+    return;
+  }
+  if (page_count > page_total - page_first) {
+    page_count = page_total - page_first;
+  }
+  ++log.ranges;
+  size_t page_size = size_t(1) << log.page_size_log2;
+  for (uint32_t i = 0; i < page_count; ++i) {
+    uint32_t page = page_first + i;
+    uint64_t hash = XXH3_64bits(guest_pages + page_size * i, page_size);
+    uint32_t block =
+        uint32_t((uint64_t(page) << log.page_size_log2) >> UploadHashLog::kBlockSizeLog2);
+    uint64_t block_bit = uint64_t(1) << (block & 63);
+    log.blocks_uploaded[block >> 6] |= block_bit;
+    uint64_t& hashed_bits = log.page_hashed[page >> 6];
+    uint64_t hashed_bit = uint64_t(1) << (page & 63);
+    if (!(hashed_bits & hashed_bit)) {
+      hashed_bits |= hashed_bit;
+      ++log.pages_first;
+    } else {
+      ++log.block_pages_rehashed[block];
+      if (log.page_hashes[page] == hash) {
+        ++log.pages_unchanged;
+      } else {
+        log.blocks_changed[block >> 6] |= block_bit;
+      }
+    }
+    log.page_hashes[page] = hash;
+  }
+  log.pages += page_count;
+}
+
+}  // namespace
 
 D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
                                      memory::Memory& memory)
@@ -333,6 +465,19 @@ bool D3D12SharedMemory::UploadRanges(
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
+    }
+  }
+  if (REXCVAR_GET(shared_memory_upload_hash_log)) {
+    // S4 u diagnostic: hash the guest copy of every page just uploaded (never
+    // the write-combined upload mapping, which is very slow to read).
+    std::lock_guard<std::mutex> upload_hash_log_lock(upload_hash_log.mutex);
+    UploadHashLogBeginCall(upload_hash_log, command_processor_.GetCurrentFrame(),
+                           page_size_log2());
+    for (const auto& upload_range : upload_page_ranges) {
+      UploadHashLogPages(upload_hash_log,
+                         static_cast<const uint8_t*>(
+                             memory().TranslatePhysical(upload_range.first << page_size_log2())),
+                         upload_range.first, upload_range.second);
     }
   }
   return true;
