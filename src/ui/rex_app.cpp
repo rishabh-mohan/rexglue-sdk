@@ -68,11 +68,11 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "preference), 'd3d12' or 'vulkan'")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(pause_safe_order, false, "UI/Window",
+REXCVAR_DEFINE_BOOL(pause_safe_order, true, "UI/Window",
                     "Pause and unpause the guest without allocating, logging, taking the object "
                     "table lock or waiting on the audio workers while guest threads are stopped: "
                     "the pause keeps the threads it suspended and the unpause resumes them first. "
-                    "Off: the original order");
+                    "Off: the original order, which can hang when the guest pauses");
 
 REXCVAR_DEFINE_INT32(debug_pause_cycle_ms, 0, "UI/Window",
                      "Debug (pause test G): 15 s after the guest starts, pause and unpause it "
@@ -738,9 +738,11 @@ void ReXApp::SetGuestPaused(bool paused) {
   }
   guest_paused_ = paused;
 
-  // pause_safe_order (default off; task #17 in perf-notes/agent12-io-memory.md). The pause
-  // picks the path and its unpause follows it, so turning the cvar on or off while the guest
-  // is paused cannot strand a thread.
+  // pause_safe_order (default on; task #17 in perf-notes/agent12-io-memory.md). The original
+  // order below can deadlock: in test G (#23, perf-notes/agent11-kernel.md) the audio pause
+  // waited on a worker stuck in a guest callback that needed the just-suspended guest threads.
+  // The pause picks the path and its unpause follows it, so turning the cvar on or off while
+  // the guest is paused cannot strand a thread.
   auto& safe_order = GetSafeOrderPause();
   if (paused ? REXCVAR_GET(pause_safe_order) : safe_order.active) {
     auto* audio = static_cast<rex::audio::AudioSystem*>(runtime_->audio_system());

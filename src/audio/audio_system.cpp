@@ -45,7 +45,7 @@ REXCVAR_DEFINE_INT32(
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
 REXCVAR_DEFINE_BOOL(
-    audio_shutdown_detach_worker, false, "Audio",
+    audio_shutdown_detach_worker, true, "Audio",
     "If the audio worker has not exited when shutdown times out, wait up to 2 s more, then "
     "leave it running and leak what it can still reach instead of force-terminating it "
     "(TerminateThread can leave the global lock held, so later shutdown steps never finish). "
