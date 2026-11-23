@@ -44,9 +44,27 @@ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allo
 
 // S4.7 fix (i), default off: see PhysicalHeap::Protect.
 REXCVAR_DEFINE_BOOL(physical_protect_hold_global_lock, false, "Memory",
-                    "Hold the global lock across both host protects in PhysicalHeap::Protect");
+                    "Hold the global lock across both host protects in PhysicalHeap::Protect")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// S4 C1 (default off): keep the write watches on physical write protects that change
+// no page's access. Engages only with physical_protect_hold_global_lock on; see
+// PhysicalHeap::ProtectKeepWatch. Both cvars are init-only (C1 v2), so the settings
+// overlay can't turn C1 on mid-run over page state from before fix (i) was on, and
+// Memory::Initialize latches both (C1 v3), so no later set reaches the protect path.
+REXCVAR_DEFINE_BOOL(physical_protect_keep_watch, false, "Memory",
+                    "Keep the write watches on physical write protects that leave every "
+                    "page's access unchanged (needs physical_protect_hold_global_lock)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::memory {
+
+// S4 C1 v3: the two cvars above, latched once by Memory::Initialize before any heap
+// exists. PhysicalHeap::Protect reads only these copies, so a set after that (the
+// dev console still can, as nothing calls FinalizeInit) changes nothing in this
+// process. Constant-initialized to off.
+static constinit std::atomic<bool> physical_protect_hold_global_lock_latched{false};
+static constinit std::atomic<bool> physical_protect_keep_watch_latched{false};
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
@@ -138,6 +156,24 @@ Memory::~Memory() {
 
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+  // S4 C1 v3: latch fix (i)'s and C1's cvars here, once, before any heap exists;
+  // PhysicalHeap::Protect reads only the latched copies.
+  const bool hold_on = REXCVAR_GET(physical_protect_hold_global_lock);
+  const bool keep_on = REXCVAR_GET(physical_protect_keep_watch);
+  physical_protect_hold_global_lock_latched.store(hold_on, std::memory_order_relaxed);
+  physical_protect_keep_watch_latched.store(keep_on, std::memory_order_relaxed);
+  // S4 C1 v2: whether physical_protect_keep_watch can engage (set both cvars at
+  // launch). Prints nothing while it is off.
+  if (keep_on) {
+    if (IsPhysicalProtectKeepWatchBlocked()) {
+      REXSYS_INFO("C1 keep-watch: on, but blocked for this process (native renderer)");
+    } else if (!hold_on) {
+      REXSYS_WARN("C1 keep-watch: on, but physical_protect_hold_global_lock is off, so no "
+                  "protect is kept");
+    } else {
+      REXSYS_INFO("C1 keep-watch: on (with physical_protect_hold_global_lock)");
+    }
+  }
   // A breadcrumb: the arena is the first thing that can fail for reasons
   // outside the game (address space, page file, a hook DLL squatting on the
   // range), and a log that ends right before it says where to look.
@@ -688,6 +724,19 @@ void* Memory::RegisterPhysicalMemoryInvalidationCallback(
   return entry;
 }
 
+// S4 C1: as above, and the guard is kept by handle for PhysicalHeap::ProtectKeepWatch.
+void* Memory::RegisterPhysicalMemoryInvalidationCallback(
+    PhysicalMemoryInvalidationCallback callback, void* callback_context,
+    PhysicalMemoryKeepWatchGuard keep_watch_guard) {
+  auto entry = new std::pair<PhysicalMemoryInvalidationCallback, void*>(callback, callback_context);
+  auto lock = global_critical_region_.Acquire();
+  physical_memory_invalidation_callbacks_.push_back(entry);
+  if (keep_watch_guard) {
+    physical_memory_keep_watch_guards_.emplace_back(entry, keep_watch_guard);
+  }
+  return entry;
+}
+
 void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle) {
   auto entry =
       reinterpret_cast<std::pair<PhysicalMemoryInvalidationCallback, void*>*>(callback_handle);
@@ -699,8 +748,52 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
     if (it != physical_memory_invalidation_callbacks_.end()) {
       physical_memory_invalidation_callbacks_.erase(it);
     }
+    // S4 C1: drop the callback's keep-watch guard, if any, with it.
+    auto guard_it = std::find_if(physical_memory_keep_watch_guards_.begin(),
+                                 physical_memory_keep_watch_guards_.end(),
+                                 [entry](const auto& item) { return item.first == entry; });
+    if (guard_it != physical_memory_keep_watch_guards_.end()) {
+      physical_memory_keep_watch_guards_.erase(guard_it);
+    }
   }
   delete entry;
+}
+
+// S4 C1: process-wide latch, read by PhysicalHeap::ProtectKeepWatch. Constant-
+// initialized, so a static initializer in another translation unit can set it.
+static constinit std::atomic<bool> physical_protect_keep_watch_blocked{false};
+
+void Memory::BlockPhysicalProtectKeepWatch() {
+  physical_protect_keep_watch_blocked.store(true, std::memory_order_relaxed);
+}
+
+bool Memory::IsPhysicalProtectKeepWatchBlocked() {
+  return physical_protect_keep_watch_blocked.load(std::memory_order_relaxed);
+}
+
+// S4 C1 v2: log lines that show whether the keep-watch path engaged. Both helpers
+// run with the global critical region held; the logger's lock is a leaf. Kept
+// protects log the first one, the powers of two below 4096, then every 4096th, so
+// the last line gives the total to within 4096.
+static constinit std::atomic<uint64_t> physical_protect_kept_count{0};
+static constinit std::atomic<bool> physical_protect_keep_watch_block_logged{false};
+
+static void NoteKeptProtect(uint32_t address, uint32_t size) {
+  const uint64_t kept = physical_protect_kept_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (kept == 1) {
+    REXSYS_INFO("C1 keep-watch: first kept protect at {:08X}, {} bytes", address, size);
+  } else if (!(kept & (kept - 1)) || !(kept & 4095)) {
+    REXSYS_INFO("C1 keep-watch: {} protects kept so far", kept);
+  }
+}
+
+static void NoteKeepWatchBlocked() {
+  // C1 v3: load first, so after the first line a native protect only reads the flag.
+  if (!physical_protect_keep_watch_block_logged.load(std::memory_order_relaxed) &&
+      !physical_protect_keep_watch_block_logged.exchange(true, std::memory_order_relaxed)) {
+    REXSYS_INFO("C1 keep-watch: blocked for this process (native renderer); every protect "
+                "takes the normal path");
+  }
 }
 
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
@@ -1802,6 +1895,43 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
   return true;
 }
 
+// S4 C1: see the declaration. Same rounding and bounds as Protect; a zero size, an
+// out-of-range or wrapping request, or guest pages smaller than host pages (Protect
+// reconciles those after the table change) return false. Only heap_mutex_ is
+// taken, so a caller that needs the global critical region holds it already.
+bool BaseHeap::ProtectAccessUnchanged(uint32_t address, uint32_t size, uint32_t protect,
+                                      bool apply) {
+  if (!size || page_size_ < memory_->system_page_size_) {
+    return false;
+  }
+  uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
+  if (start_page_number >= page_table_.size()) {
+    return false;
+  }
+  uint32_t end_page_number =
+      uint32_t((uint64_t(address) + size - 1 - heap_base_) >> page_size_shift_);
+  if (end_page_number >= page_table_.size()) {
+    return false;
+  }
+  const memory::PageAccess access = ToPageAccess(protect);
+  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  const uint32_t base_address = page_table_[start_page_number].base_address;
+  for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
+    const auto& page_entry = page_table_[page_number];
+    if (page_entry.base_address != base_address ||
+        !(page_entry.state & memory::kMemoryAllocationCommit) ||
+        ToPageAccess(page_entry.current_protect) != access) {
+      return false;
+    }
+  }
+  if (apply) {
+    for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
+      page_table_[page_number].current_protect = protect;
+    }
+  }
+  return true;
+}
+
 bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info) {
   uint32_t start_page_number = (base_address - heap_base_) >> page_size_shift_;
   if (start_page_number > page_table_.size()) {
@@ -2144,8 +2274,20 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // is already held across parent_heap_->Protect and BaseHeap::Protect (global
   // critical region before heap_mutex_).
   std::unique_lock<std::recursive_mutex> hold_global_lock;
-  if ((protect & memory::kMemoryProtectWrite) && REXCVAR_GET(physical_protect_hold_global_lock)) {
+  if ((protect & memory::kMemoryProtectWrite) &&
+      physical_protect_hold_global_lock_latched.load(std::memory_order_relaxed)) {
     hold_global_lock = global_critical_region_.Acquire();
+  }
+
+  // S4 C1, physical_protect_keep_watch (default off): with fix (i)'s hold, a write
+  // protect that changes no page's access may keep the range's write watches armed
+  // (see ProtectKeepWatch). Off, without the hold, or with old_protect: the
+  // original path below.
+  if (hold_global_lock.owns_lock() && !old_protect &&
+      physical_protect_keep_watch_latched.load(std::memory_order_relaxed) &&
+      ProtectKeepWatch(address, size, protect)) {
+    NoteKeptProtect(address, size);
+    return true;
   }
 
   // Only invalidate if making writable again, for simplicity - not when simply
@@ -2160,6 +2302,101 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
 
   return BaseHeap::Protect(address, size, protect);
+}
+
+// S4 C1, physical_protect_keep_watch (default off). Protect calls this only for a
+// write protect without old_protect and with fix (i)'s hold, so the global critical
+// region (G) is held, twice, until Protect returns. When every page keeps its
+// access, the normal path's host protects change nothing on a page whose host
+// protection matches its table entry, and its TriggerCallbacks fires and drops the
+// write watches on the range. Here the watches stay armed instead: a later CPU
+// write still faults and fires them, and a range that is never written keeps its
+// GPU copy. Returns true if the protect is done; false sends Protect down the
+// normal path, with nothing changed except at most page table entries set to the
+// value that path writes too. Required, all checked under G:
+//  1. every page (Protect's rounding) keeps its access in this heap and in the
+//     parent heap, and they are committed pages of one region (as Protect needs);
+//  2. every invalidation callback has a keep-watch guard and the guard allows the
+//     range (TriggerCallbacks' physical range); a callback without one, such as
+//     rexlego's, keeps the normal path;
+//  3. SharedMemory's guard: no valid page in the range holds GPU-written data;
+//  4. no host page of the guest pages Protect would change waits for its data
+//     provider (the normal path makes those host-writable without providing data).
+// The guards run first, under G and before any heap mutex, and take no lock. Then
+// G -> this heap_mutex_, released, and G -> the parent's heap_mutex_: the two heap
+// mutexes are never nested. Memory::BlockPhysicalProtectKeepWatch (rexlego's native
+// renderer, from static init) turns this off for the process.
+bool PhysicalHeap::ProtectKeepWatch(uint32_t address, uint32_t size, uint32_t protect) {
+  if (Memory::IsPhysicalProtectKeepWatchBlocked()) {
+    NoteKeepWatchBlocked();
+    return false;
+  }
+  // Inside this heap, not empty and not wrapping; anything else keeps the normal path.
+  if (!size || address < heap_base_ || address - heap_base_ >= heap_size_ ||
+      size > heap_size_ - (address - heap_base_)) {
+    return false;
+  }
+  uint32_t heap_relative_address = address - heap_base_;
+
+  // 2 and 3: the guards, with the physical range TriggerCallbacks would pass to the
+  // callbacks.
+  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
+  uint32_t system_page_last =
+      (heap_relative_address + size - 1 + host_address_offset()) / system_page_size_;
+  if (system_page_last >= system_page_count_) {
+    return false;
+  }
+  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
+  uint32_t physical_address_start =
+      rex::sat_sub(system_page_first * system_page_size_, host_address_offset()) +
+      physical_address_offset;
+  uint32_t physical_length =
+      std::min(rex::sat_sub(system_page_last * system_page_size_ + system_page_size_,
+                            host_address_offset()) +
+                   physical_address_offset - physical_address_start,
+               heap_size_ - (physical_address_start - physical_address_offset));
+  for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
+    Memory::PhysicalMemoryKeepWatchGuard guard = nullptr;
+    for (const auto& item : memory_->physical_memory_keep_watch_guards_) {
+      if (item.first == invalidation_callback) {
+        guard = item.second;
+        break;
+      }
+    }
+    if (!guard || !guard(invalidation_callback->second, physical_address_start, physical_length)) {
+      return false;
+    }
+  }
+
+  // 4: data providers, over the host pages of the guest pages Protect would change.
+  uint32_t provide_page_first =
+      ((heap_relative_address & ~(page_size_ - 1)) + host_address_offset()) / system_page_size_;
+  uint32_t provide_page_last =
+      (((heap_relative_address + (size - 1)) | (page_size_ - 1)) + host_address_offset()) /
+      system_page_size_;
+  provide_page_last = std::min(provide_page_last, system_page_count_ - 1);
+  for (uint32_t i = provide_page_first >> 6; i <= (provide_page_last >> 6); ++i) {
+    uint64_t block = system_page_flags_[i].provide_data;
+    if (i == (provide_page_first >> 6)) {
+      block &= ~((uint64_t(1) << (provide_page_first & 63)) - 1);
+    }
+    if (i == (provide_page_last >> 6) && (provide_page_last & 63) != 63) {
+      block &= (uint64_t(1) << ((provide_page_last & 63) + 1)) - 1;
+    }
+    if (block) {
+      return false;
+    }
+  }
+
+  // 1: the access of every page in both page tables. Check both, then store both,
+  // each under its own heap_mutex_ only.
+  uint32_t parent_address = GetPhysicalAddress(address);
+  if (!ProtectAccessUnchanged(address, size, protect, false) ||
+      !parent_heap_->ProtectAccessUnchanged(parent_address, size, protect, false)) {
+    return false;
+  }
+  return ProtectAccessUnchanged(address, size, protect, true) &&
+         parent_heap_->ProtectAccessUnchanged(parent_address, size, protect, true);
 }
 
 // notify_on_invalidation is only written with the global critical region held,

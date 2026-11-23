@@ -99,6 +99,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// S4 #18 (R1 stage 1): end the open submission (not the frame) at the tail of
+// a draw or resolve once its deferred command list has reached this many KB.
+// It reuses the existing mid-frame EndSubmission(false) path, and holds the
+// split while ending the submission would change behaviour (see
+// MaybeSplitSubmission). A test bed for the split rules: each split adds a
+// Close plus ExecuteCommandLists, so expect a small cost, not a win. Read once
+// in SetupContext. Leave it at 0 on native builds unless tested there.
+REXCVAR_DEFINE_UINT32(d3d12_submit_split_kb, 0, "GPU/D3D12",
+                      "Split a submission mid-frame once its deferred command list reaches "
+                      "this many KB (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -235,6 +247,11 @@ PixelShaderFrameStats& FrameStats() {
   return stats;
 }
 
+// Memexporting draws with no known destination range: IssueDraw then marks all
+// of shared memory as written by the GPU. Counted (relaxed) on the command
+// thread; ReportSlowFrame takes the count each frame and prints it.
+std::atomic<uint64_t> memexport_full_buffer_draws{0};
+
 // Called on every swap from the command thread: if the frame that just ended
 // took longer than slow_frame_log_ms, log what the command thread spent it on.
 // Idle time is the tell: a slow frame the command thread mostly idled through
@@ -256,6 +273,9 @@ void ReportSlowFrame() {
             c.us.exchange(0, std::memory_order_relaxed),
             c.extra.exchange(0, std::memory_order_relaxed)};
   }
+  static uint64_t full_buffer_total = 0;
+  const uint64_t full_buffer = memexport_full_buffer_draws.exchange(0, std::memory_order_relaxed);
+  full_buffer_total += full_buffer;
   const bool first = last_swap == clock::time_point{};
   const uint64_t frame_us =
       first ? 0
@@ -272,7 +292,8 @@ void ReportSlowFrame() {
       "shader translate {:.1f} ({}x) | pipeline create {:.1f} ({}x), new {} | "
       "texture load {:.1f} ({}x) | readback {}x {} KB, {} stalled | "
       "cpu-write invalidations {}x {} KB (on memexport pages {}x {} KB) | "
-      "memexport syncs {} ({} KB), on demand {} ({} KB)",
+      "memexport syncs {} ({} KB), on demand {} ({} KB) | "
+      "memexport full-buffer {}x (total {})",
       frame_index, ms(frame_us), ms(s[kCpIdle].us), ms(s[kFenceWait].us), s[kFenceWait].count,
       ms(s[kShaderTranslate].us), s[kShaderTranslate].count, ms(s[kPipelineCreate].us),
       s[kPipelineCreate].count, s[kPipelineMiss].count, ms(s[kTextureLoad].us),
@@ -280,7 +301,7 @@ void ReportSlowFrame() {
       s[kReadbackResolve].us, s[kMemoryInvalidate].count, s[kMemoryInvalidate].extra / 1024,
       s[kMemexportPageInvalidate].count, s[kMemexportPageInvalidate].extra / 1024,
       s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024, s[kMemexportOnDemand].count,
-      s[kMemexportOnDemand].extra / 1024);
+      s[kMemexportOnDemand].extra / 1024, full_buffer, full_buffer_total);
 }
 
 uint64_t ParseHashArg(std::string_view args) {
@@ -1173,6 +1194,16 @@ bool D3D12CommandProcessor::SetupContext() {
 
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
+
+  // S4 #18: cached once (the cvar is kInitOnly), so with it at 0 a draw or
+  // resolve pays one compare.
+  submit_split_bytes_ = size_t(REXCVAR_GET(d3d12_submit_split_kb)) * 1024;
+  submit_split_stats_ = {};
+  submit_split_last_log_ = {};
+  if (submit_split_bytes_) {
+    REXGPU_INFO("d3d12_submit_split_kb: splitting submissions at {} KB of deferred commands",
+                REXCVAR_GET(d3d12_submit_split_kb));
+  }
 
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
@@ -3061,6 +3092,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // Stream constants can be invalid or dynamic, so exact destinations may
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+      memexport_full_buffer_draws.fetch_add(1, std::memory_order_relaxed);
     }
     if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
         !memexport_ranges_.empty()) {
@@ -3080,6 +3112,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         }
       }
     }
+  }
+
+  if (submit_split_bytes_) {
+    // S4 #18: the draw, its barriers and any memexport readback are fully
+    // recorded here.
+    MaybeSplitSubmission();
   }
 
   return true;
@@ -3674,12 +3712,20 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  bool resolved;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                             written_address, written_length);
+  } else {
+    resolved = IssueCopy_ReadbackResolvePath();
   }
-  return IssueCopy_ReadbackResolvePath();
+  if (submit_split_bytes_ && resolved) {
+    // S4 #18: the resolve, its barriers and any readback are fully recorded
+    // here.
+    MaybeSplitSubmission();
+  }
+  return resolved;
 }
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4323,6 +4369,53 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {
   return !submission_open_ || !pipeline_cache_->IsCreatingPipelines();
+}
+
+void D3D12CommandProcessor::MaybeSplitSubmission() {
+  // S4 #18 (R1 stage 1). Called only with d3d12_submit_split_kb on, on the GPU
+  // Commands thread, from the tails of IssueDraw and IssueCopy once the
+  // command and its barriers are fully recorded: never mid-packet, and never
+  // from IssueSwap or RefreshGuestOutput (cond 1).
+  if (!submission_open_ || !frame_open_ ||
+      deferred_command_list_.GetSizeBytes() < submit_split_bytes_) {
+    return;
+  }
+  // A split is due (cond 2). Hold it, and try again after the next draw or
+  // resolve, while ending the submission now would change behaviour:
+  // - EndSubmission would end the active occlusion query early;
+  // - EndSubmission asserts that the scratch buffer is free;
+  // - EndSubmission would wait for pending pipeline creation.
+  if (active_occlusion_query_.valid) {
+    ++submit_split_stats_.held_query;
+  } else if (scratch_buffer_used_) {
+    ++submit_split_stats_.held_scratch;
+  } else if (!CanEndSubmissionImmediately()) {
+    ++submit_split_stats_.held_pipelines;
+  } else if (EndSubmission(false)) {
+    // The frame stays open (is_swap is false). The next draw or resolve calls
+    // BeginSubmission, which reopens the submission, resets the deferred
+    // command list and re-binds every cached state. DeferredCommandList::Execute
+    // keeps no state across submissions, so a split also resets R2's counter
+    // state (S4 #20, cond (d)).
+    ++submit_split_stats_.splits;
+  } else {
+    // No command allocator: EndSubmission left the submission open. Carry on
+    // recording into it; BeginSubmission is not called here (cond 3).
+    ++submit_split_stats_.failed;
+  }
+  // The counter line, about every 10 s while splits are due and only with the
+  // cvar on. submission is the next fence value, so its change over frame's
+  // change is the submissions per frame.
+  auto now = std::chrono::steady_clock::now();
+  if (now - submit_split_last_log_ >= std::chrono::seconds(10)) {
+    submit_split_last_log_ = now;
+    REXGPU_INFO(
+        "d3d12_submit_split: frame={} submission={} splits={} failed={} held_query={} "
+        "held_scratch={} held_pipelines={}",
+        frame_current_, submission_current_, submit_split_stats_.splits,
+        submit_split_stats_.failed, submit_split_stats_.held_query,
+        submit_split_stats_.held_scratch, submit_split_stats_.held_pipelines);
+  }
 }
 
 void D3D12CommandProcessor::ClearCommandAllocatorCache() {

@@ -85,6 +85,10 @@ REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
 
 namespace rex::graphics {
 
+// S4 C1: the converted index cache lets a keep-watch protect keep its write watches;
+// a later CPU write still faults and invalidates the cached conversions.
+static bool MemoryKeepWatchGuardAlwaysAllow(void*, uint32_t, uint32_t) { return true; }
+
 // SIMD processing here assumes that alignment is not required (neither AVX nor
 // Neon requires it) and there's no punishment for using an unaligned access
 // instruction when the data is actually aligned (AVX has separate aligned /
@@ -1362,7 +1366,7 @@ PrimitiveProcessor::CacheTransaction::CacheTransaction(PrimitiveProcessor& proce
     if (!processor_.memory_invalidation_callback_handle_) {
       processor_.memory_invalidation_callback_handle_ =
           processor_.memory_.RegisterPhysicalMemoryInvalidationCallback(
-              MemoryInvalidationCallbackThunk, &processor_);
+              MemoryInvalidationCallbackThunk, &processor_, MemoryKeepWatchGuardAlwaysAllow);
     }
     processor_.memory_.EnablePhysicalMemoryAccessCallbacks(key_.base, size_bytes, true, false);
   }

@@ -21,7 +21,12 @@
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+#if REX_ARCH_AMD64
+#include <emmintrin.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
@@ -36,6 +41,15 @@ REXCVAR_DEFINE_BOOL(shared_memory_upload_hash_log, false, "GPU/D3D12",
                     "Diagnostic: log per frame how many re-uploaded shared memory pages are "
                     "byte-identical to their previous upload (costs one XXH3 pass over "
                     "every uploaded byte on the GPU thread)");
+
+// S4 M1 (default off). When on, UploadRanges copies the guest pages into the
+// upload buffer (write-combined memory on discrete GPUs) with SSE2 non-temporal
+// stores and an sfence instead of std::memcpy (x86-64 only, std::memcpy
+// elsewhere). Same bytes, same order of MakeRangeValid, copy and copy command.
+// Off: the original std::memcpy plus one cvar load per UploadRanges call.
+REXCVAR_DEFINE_BOOL(shared_memory_upload_nontemporal_copy, false, "GPU/D3D12",
+                    "Copy shared memory uploads into the write-combined upload buffer with "
+                    "non-temporal (streaming) SSE2 stores and an sfence instead of memcpy");
 
 namespace rex::graphics::d3d12 {
 
@@ -155,6 +169,53 @@ void UploadHashLogPages(UploadHashLog& log, const uint8_t* guest_pages, uint32_t
     log.page_hashes[page] = hash;
   }
   log.pages += page_count;
+}
+
+// S4 M1 (shared_memory_upload_nontemporal_copy): std::memcpy replacement for
+// copying guest memory into the upload buffer mapping, which is write-combined
+// on discrete GPUs and never read back here. UploadRanges passes a page-aligned
+// dst and a whole number of pages, so normally only the streaming loop runs;
+// the head and tail keep it correct for any alignment and size:
+// - head: plain copy up to the first 64-byte boundary of dst, because
+//   _mm_stream_si128 needs 16-byte alignment (it faults otherwise), and so no
+//   cache line gets both plain and streaming stores;
+// - body: whole 64-byte lines, unaligned loads from src, aligned streaming
+//   stores to dst (4 x 16 bytes fill one write-combining buffer);
+// - tail: plain copy of the last size % 64 bytes.
+// Streaming stores (and plain stores to write-combined memory) are weakly
+// ordered: the sfence makes them all globally visible before returning, so
+// before the copy command is recorded and long before ExecuteCommandLists lets
+// the GPU read them.
+void CopyToUploadBufferNonTemporal(uint8_t* dst, const uint8_t* src, size_t size) {
+#if REX_ARCH_AMD64
+  size_t head = (64 - (reinterpret_cast<uintptr_t>(dst) & 63)) & 63;
+  if (head > size) {
+    head = size;
+  }
+  if (head) {
+    std::memcpy(dst, src, head);
+    dst += head;
+    src += head;
+    size -= head;
+  }
+  size_t body = size & ~size_t(63);
+  for (size_t offset = 0; offset < body; offset += 64) {
+    __m128i data0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + offset));
+    __m128i data1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + offset + 16));
+    __m128i data2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + offset + 32));
+    __m128i data3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + offset + 48));
+    _mm_stream_si128(reinterpret_cast<__m128i*>(dst + offset), data0);
+    _mm_stream_si128(reinterpret_cast<__m128i*>(dst + offset + 16), data1);
+    _mm_stream_si128(reinterpret_cast<__m128i*>(dst + offset + 32), data2);
+    _mm_stream_si128(reinterpret_cast<__m128i*>(dst + offset + 48), data3);
+  }
+  if (size > body) {
+    std::memcpy(dst + body, src + body, size - body);
+  }
+  _mm_sfence();
+#else
+  std::memcpy(dst, src, size);
+#endif
 }
 
 }  // namespace
@@ -441,6 +502,7 @@ bool D3D12SharedMemory::UploadRanges(
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
+  const bool nontemporal_copy = REXCVAR_GET(shared_memory_upload_nontemporal_copy);
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
@@ -456,9 +518,16 @@ bool D3D12SharedMemory::UploadRanges(
         return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      if (nontemporal_copy) {
+        CopyToUploadBufferNonTemporal(
+            upload_buffer_mapping,
+            memory().TranslatePhysical(upload_range_start << page_size_log2()),
+            upload_buffer_size);
+      } else {
+        std::memcpy(upload_buffer_mapping,
+                    memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                    upload_buffer_size);
+      }
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

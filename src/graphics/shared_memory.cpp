@@ -19,6 +19,8 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/hash.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
@@ -33,6 +35,15 @@ REXCVAR_DEFINE_BOOL(shared_memory_single_hold_rearm, false, "GPU",
                     "Hold the global lock once across a shared memory range's valid-bit "
                     "update and its write-watch re-arm (fewer lock releases and waiter "
                     "wakes on the GPU thread)");
+
+// S4 C1 verify (default off; set it at launch). Hashes every page of each CPU upload
+// once its write watch is armed. A keep-watch protect (K) or a write fault (F) that
+// finds a still-valid page changed logs it, and K sends that protect down the
+// normal path. With physical_protect_keep_watch off, the F count is today's rate.
+REXCVAR_DEFINE_BOOL(physical_protect_keep_watch_verify, false, "GPU",
+                    "Verify physical_protect_keep_watch: hash CPU uploads and log pages that "
+                    "changed without a write fault (slow; diagnostics only)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -52,8 +63,9 @@ void SharedMemory::InitializeCommon() {
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
 
-  memory_invalidation_callback_handle_ =
-      memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+  // S4 C1: with SharedMemory's keep-watch guard (condition 3, verify mode's K check).
+  memory_invalidation_callback_handle_ = memory_.RegisterPhysicalMemoryInvalidationCallback(
+      MemoryInvalidationCallbackThunk, this, MemoryKeepWatchGuardThunk);
 }
 
 void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
@@ -363,6 +375,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
   }
+
+  // S4 C1 verify: hash the pages once the watch is armed (a later write faults and
+  // clears valid before it lands).
+  if (REXCVAR_GET(physical_protect_keep_watch_verify) && memory_invalidation_callback_handle_) {
+    KeepWatchVerifyRecord(valid_page_first, valid_page_last, written_by_gpu);
+  }
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
@@ -558,6 +576,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
+  // S4 C1 verify (F): a write fault comes before its write lands, so a page that is
+  // still valid must still match its upload hash.
+  if (!exact_range && keep_watch_verify_hashes_) {
+    KeepWatchVerifyCheck(page_first, page_last, false);
+  }
+
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
@@ -602,6 +626,116 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
+}
+
+bool SharedMemory::MemoryKeepWatchGuardThunk(void* context_ptr, uint32_t physical_address_start,
+                                             uint32_t length) {
+  return reinterpret_cast<SharedMemory*>(context_ptr)
+      ->MemoryKeepWatchGuard(physical_address_start, length);
+}
+
+// S4 C1 condition 3: a write protect may keep the watches on a range only if no
+// valid page in it holds GPU-written data. Called by PhysicalHeap::ProtectKeepWatch
+// with the global critical region held and before any heap mutex; takes no lock.
+// In verify mode it also refuses a range whose CPU-uploaded pages changed (K).
+bool SharedMemory::MemoryKeepWatchGuard(uint32_t physical_address_start, uint32_t length) {
+  if (length == 0 || physical_address_start >= kBufferSize) {
+    return true;
+  }
+  length = std::min(length, kBufferSize - physical_address_start);
+  uint32_t page_first = physical_address_start >> page_size_log2_;
+  uint32_t page_last = (physical_address_start + (length - 1)) >> page_size_log2_;
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t gpu_written_bits = system_page_flags_valid_and_gpu_written_[i];
+    if (i == block_first) {
+      gpu_written_bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      gpu_written_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (gpu_written_bits) {
+      return false;
+    }
+  }
+  return !keep_watch_verify_hashes_ || KeepWatchVerifyCheck(page_first, page_last, true);
+}
+
+// Verify mode only: whether the host page at host can be read, so hashing it can't
+// fault (a valid page can be no-access in the physical view). readable_end caches
+// the end of the last readable host region, for ascending pages.
+static bool KeepWatchVerifyReadable(uint8_t* host, size_t page_size, uint8_t*& readable_end) {
+  if (readable_end && host < readable_end) {
+    return true;
+  }
+  size_t length = page_size;
+  memory::PageAccess access;
+  if (!memory::QueryProtect(host, length, access) || access == memory::PageAccess::kNoAccess) {
+    return false;
+  }
+  readable_end = host + length;
+  return true;
+}
+
+// Verify mode: hash each page of a CPU upload after its write watch is armed (any
+// later write faults and clears valid first). GPU-written and unreadable pages get
+// 0, which the checks skip.
+void SharedMemory::KeepWatchVerifyRecord(uint32_t page_first, uint32_t page_last,
+                                         bool written_by_gpu) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!keep_watch_verify_hashes_) {
+    keep_watch_verify_hashes_ = std::make_unique<uint64_t[]>(kBufferSize >> page_size_log2_);
+    REXGPU_INFO(
+        "C1 verify: on. Hashing CPU uploads; K checks keep-watch protects, F checks write "
+        "faults");
+  }
+  const size_t page_size = size_t(1) << page_size_log2_;
+  uint8_t* readable_end = nullptr;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    uint64_t hash = 0;
+    if (!written_by_gpu) {
+      uint8_t* host = memory_.TranslatePhysical(page << page_size_log2_);
+      if (KeepWatchVerifyReadable(host, page_size, readable_end)) {
+        hash = XXH3_64bits(host, page_size) | 1;
+      }
+    }
+    keep_watch_verify_hashes_[page] = hash;
+  }
+}
+
+// Verify mode: compare still-valid CPU-uploaded pages with their upload hashes.
+// Called with the global critical region held: K from the keep-watch guard (no lock
+// taken; the logger's lock is a leaf), F from a write fault before its write lands.
+// Returns false if any page changed.
+bool SharedMemory::KeepWatchVerifyCheck(uint32_t page_first, uint32_t page_last,
+                                        bool at_protect) {
+  const size_t page_size = size_t(1) << page_size_log2_;
+  uint8_t* readable_end = nullptr;
+  bool unchanged = true;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    uint64_t hash = keep_watch_verify_hashes_[page];
+    uint64_t page_bit = uint64_t(1) << (page & 63);
+    if (!hash || !(system_page_flags_valid_[page >> 6] & page_bit) ||
+        (system_page_flags_valid_and_gpu_written_[page >> 6] & page_bit)) {
+      continue;
+    }
+    uint8_t* host = memory_.TranslatePhysical(page << page_size_log2_);
+    if (!KeepWatchVerifyReadable(host, page_size, readable_end) ||
+        (XXH3_64bits(host, page_size) | 1) == hash) {
+      continue;
+    }
+    unchanged = false;
+    uint64_t& mismatches =
+        at_protect ? keep_watch_verify_protect_mismatches_ : keep_watch_verify_fault_mismatches_;
+    ++mismatches;
+    if (mismatches <= 256 || !(mismatches & 4095)) {
+      REXGPU_WARN("C1 verify {}: page {:08X} changed since its upload ({} so far){}",
+                  at_protect ? 'K' : 'F', page << page_size_log2_, mismatches,
+                  at_protect ? "; protect keeps the normal path" : "");
+    }
+  }
+  return unchanged;
 }
 
 bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length) {

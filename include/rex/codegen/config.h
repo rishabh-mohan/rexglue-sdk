@@ -107,6 +107,7 @@ struct RecompilerConfig {
   bool crCompareSoZero = false;   ///< Compares store SO=0 when no image instruction sets XER.SO
   bool musttailCalls = false;     ///< Tail calls as [[clang::musttail]] return f(ctx, base)
   bool vmxVectorFallbacks = false;  ///< SSE forms for VMX ops emitted as scalar lane loops
+  bool db16cycPause = false;        ///< db16cyc emits simde_mm_pause() (a spin-wait hint)
 
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets

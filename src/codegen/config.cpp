@@ -126,6 +126,8 @@ bool ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("musttail_calls"), "musttail_calls");
   MergeBool(cfg.vmxVectorFallbacks, toml["vmx_vector_fallbacks"].value_or(false),
             hasBool("vmx_vector_fallbacks"), "vmx_vector_fallbacks");
+  MergeBool(cfg.db16cycPause, toml["db16cyc_pause"].value_or(false), hasBool("db16cyc_pause"),
+            "db16cyc_pause");
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -347,6 +348,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
+  // S4 #18 (R1 stage 1): with d3d12_submit_split_kb on, ends the open
+  // submission (not the frame) once its deferred command list is large enough
+  // and ending it now would not change behaviour. Call only at the tail of a
+  // fully recorded draw or resolve.
+  void MaybeSplitSubmission();
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFence(submission_current_);
     return submission_completed_ + 1 >= submission_current_;
@@ -851,6 +857,19 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // S4 #18 (R1 stage 1): the split size in bytes, cached in SetupContext from
+  // the kInitOnly cvar d3d12_submit_split_kb (0 = off), and the counters for
+  // its log line (written only when on).
+  size_t submit_split_bytes_ = 0;
+  struct SubmitSplitStats {
+    uint64_t splits = 0;
+    uint64_t failed = 0;
+    uint64_t held_query = 0;
+    uint64_t held_scratch = 0;
+    uint64_t held_pipelines = 0;
+  } submit_split_stats_;
+  std::chrono::steady_clock::time_point submit_split_last_log_{};
 };
 
 }  // namespace rex::graphics::d3d12

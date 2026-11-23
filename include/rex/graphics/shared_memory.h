@@ -191,6 +191,19 @@ class SharedMemory {
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
 
+  // S4 C1 (physical_protect_keep_watch): keep-watch guard, called with the global
+  // critical region held and before any heap mutex; it takes no lock.
+  static bool MemoryKeepWatchGuardThunk(void* context_ptr, uint32_t physical_address_start,
+                                        uint32_t length);
+  bool MemoryKeepWatchGuard(uint32_t physical_address_start, uint32_t length);
+  // physical_protect_keep_watch_verify: per-page hashes of CPU uploads (0: none),
+  // allocated by the first record. Protected by global_critical_region.
+  void KeepWatchVerifyRecord(uint32_t page_first, uint32_t page_last, bool written_by_gpu);
+  bool KeepWatchVerifyCheck(uint32_t page_first, uint32_t page_last, bool at_protect);
+  std::unique_ptr<uint64_t[]> keep_watch_verify_hashes_;
+  uint64_t keep_watch_verify_protect_mismatches_ = 0;
+  uint64_t keep_watch_verify_fault_mismatches_ = 0;
+
   struct GlobalWatch {
     GlobalWatchCallback callback;
     void* callback_context;

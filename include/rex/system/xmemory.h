@@ -205,6 +205,12 @@ class BaseHeap {
   virtual bool Protect(uint32_t address, uint32_t size, uint32_t protect,
                        uint32_t* old_protect = nullptr);
 
+  // S4 C1 (physical_protect_keep_watch): true if Protect(address, size, protect)
+  // would leave the access of every page unchanged (Protect's rounding; committed
+  // pages of one region). With apply, it also stores protect in those page table
+  // entries, as Protect does. Takes heap_mutex_ only.
+  bool ProtectAccessUnchanged(uint32_t address, uint32_t size, uint32_t protect, bool apply);
+
   // Queries information about the given region of pages.
   bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
 
@@ -340,6 +346,9 @@ class PhysicalHeap : public BaseHeap {
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
   void SetDataProviders(uint32_t physical_address, uint32_t length, bool enable);
+  // S4 C1: PhysicalHeap::Protect's keep-watch path (see the definition). The caller
+  // holds the global critical region.
+  bool ProtectKeepWatch(uint32_t address, uint32_t size, uint32_t protect);
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
   // pass takes the global critical region. Acquire whenever this heap or its
@@ -514,6 +523,22 @@ class Memory {
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
 
+  // S4 C1 (physical_protect_keep_watch): a keep-watch guard returns true if a write
+  // protect may leave this callback's write watches armed over the physical range
+  // instead of firing them. It is called with the global critical region held and
+  // before any heap mutex, so it must take no lock and must not call into a heap.
+  typedef bool (*PhysicalMemoryKeepWatchGuard)(void* context_ptr, uint32_t physical_address_start,
+                                               uint32_t length);
+  // As above, plus a keep-watch guard (nullptr: none). While a callback without a
+  // guard is registered, every write protect takes the normal path.
+  void* RegisterPhysicalMemoryInvalidationCallback(PhysicalMemoryInvalidationCallback callback,
+                                                   void* callback_context,
+                                                   PhysicalMemoryKeepWatchGuard keep_watch_guard);
+  // Turns physical_protect_keep_watch off for the rest of the process. Lock-free, so
+  // a static initializer may call it (rexlego's native renderer does).
+  static void BlockPhysicalProtectKeepWatch();
+  static bool IsPhysicalProtectKeepWatchBlocked();
+
   // Enables physical memory access callbacks for the specified memory range,
   // snapped to system page boundaries.
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
@@ -660,6 +685,10 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  // S4 C1: keep-watch guards by callback handle, guarded like the callbacks above.
+  std::vector<std::pair<std::pair<PhysicalMemoryInvalidationCallback, void*>*,
+                        PhysicalMemoryKeepWatchGuard>>
+      physical_memory_keep_watch_guards_;
   PhysicalMemoryDataProvider physical_memory_data_provider_ = nullptr;
   void* physical_memory_data_provider_context_ = nullptr;
 };

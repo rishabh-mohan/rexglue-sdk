@@ -49,8 +49,12 @@ bool build_eieio(BuilderContext& ctx) {
 }
 
 bool build_db16cyc(BuilderContext& ctx) {
-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
-  (void)ctx;
+  // Xenon-specific 16-cycle delay hint. By default it emits nothing (no effect in
+  // recompiled code). With db16cyc_pause each one emits a spin-wait hint, so a
+  // guest delay loop yields to the sibling hyperthread instead of running empty.
+  // simde_mm_pause() is x86 PAUSE here and is already in the generated pch.
+  if (ctx.config().db16cycPause)
+    ctx.println("\tsimde_mm_pause();");
   return true;
 }
 
