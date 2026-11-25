@@ -35,11 +35,11 @@ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data pat
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
 
-// Default off (session-2 batch rule); 1 / true is the recommended setting.
-REXCVAR_DEFINE_UINT32(host_timer_resolution_ms, 0, "Runtime",
+// Default 1 / true (final build: WC win3 arm); 0 / false restore the old behaviour.
+REXCVAR_DEFINE_UINT32(host_timer_resolution_ms, 1, "Runtime",
                       "Host timer resolution to request at startup, in ms (0 = OS default; "
                       "1 recommended)");
-REXCVAR_DEFINE_BOOL(host_timer_throttling_optout, false, "Runtime",
+REXCVAR_DEFINE_BOOL(host_timer_throttling_optout, true, "Runtime",
                     "Keep the host timer resolution while the window is minimized or occluded");
 
 REXCVAR_DECLARE(std::string, perf_log_csv);
@@ -51,6 +51,31 @@ Runtime* Runtime::instance_ = nullptr;
 
 // The runtime that applied the host timing settings; it restores them.
 static Runtime* host_timing_owner_ = nullptr;
+
+// Final build (build/agent2/final): one startup line with the value and source of each
+// rexruntime switch whose default the final build changed, so a log shows whether a
+// launch ran the shipped defaults. rexgpu-xenos logs its two in SharedMemory.
+static void LogFinalDefaults() {
+  static constexpr const char* kNames[] = {
+      "physical_protect_hold_global_lock", "physical_protect_keep_watch",
+      "host_timer_resolution_ms",          "host_timer_throttling_optout",
+      "precise_guest_sleep",               "wait_timeout_round_up",
+      "cs_spin",                           "spinlock_pause_spin",
+      "clock_lockfree",                    "tls_bounds_fix",
+      "timer_queue_precise_wait"};
+  static constexpr const char* kSources[] = {"default", "config", "env", "cmdline", "runtime"};
+  std::string line;
+  for (const char* name : kNames) {
+    if (!cvar::GetFlagInfo(name)) {
+      line += fmt::format(" {}=unregistered", name);
+      continue;
+    }
+    const auto source = static_cast<size_t>(cvar::GetFlagSource(name));
+    line += fmt::format(" {}={}({})", name, cvar::GetFlagByName(name),
+                        source < std::size(kSources) ? kSources[source] : "?");
+  }
+  REXSYS_INFO("Final defaults:{}", line);
+}
 
 Runtime* Runtime::instance() {
   return instance_;
@@ -143,6 +168,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
     timing.keep_timer_resolution_in_background = REXCVAR_GET(host_timer_throttling_optout);
     thread::ConfigureHostTiming(timing);
     host_timing_owner_ = this;
+    LogFinalDefaults();
   }
 
   // Create memory system first

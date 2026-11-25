@@ -24,14 +24,14 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
-// S4 P2 (default off). When on, MakeRangeValid holds the global critical region
+// S4 P2 (default on, final build). When on, MakeRangeValid holds the global critical region
 // once over the valid-bit update and the write-watch re-arm, and
 // RangeWrittenByGpu holds it once over FireWatches and MakeRangeValid. The inner
 // acquires (the scope in MakeRangeValid, FireWatches, EnableAccessCallbacks in
 // each view) become recursive re-entries, so G is released, and a waiter woken,
 // once per call instead of 4 (MakeRangeValid) or 5 (RangeWrittenByGpu) times.
 // Off: one cvar load and one untaken branch per call; the original code runs.
-REXCVAR_DEFINE_BOOL(shared_memory_single_hold_rearm, false, "GPU",
+REXCVAR_DEFINE_BOOL(shared_memory_single_hold_rearm, true, "GPU",
                     "Hold the global lock once across a shared memory range's valid-bit "
                     "update and its write-watch re-arm (fewer lock releases and waiter "
                     "wakes on the GPU thread)");
@@ -46,6 +46,16 @@ REXCVAR_DEFINE_BOOL(physical_protect_keep_watch_verify, false, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
+
+namespace {
+// Final build (build/agent2/final): "name=value(source)" for the startup defaults line.
+std::string FinalDefault(const char* name) {
+  static constexpr const char* kSources[] = {"default", "config", "env", "cmdline", "runtime"};
+  const auto source = static_cast<size_t>(cvar::GetFlagSource(name));
+  return fmt::format("{}={}({})", name, cvar::GetFlagByName(name),
+                     source < std::size(kSources) ? kSources[source] : "?");
+}
+}  // namespace
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -66,6 +76,9 @@ void SharedMemory::InitializeCommon() {
   // S4 C1: with SharedMemory's keep-watch guard (condition 3, verify mode's K check).
   memory_invalidation_callback_handle_ = memory_.RegisterPhysicalMemoryInvalidationCallback(
       MemoryInvalidationCallbackThunk, this, MemoryKeepWatchGuardThunk);
+
+  REXGPU_INFO("Final defaults (GPU): {} {}", FinalDefault("shared_memory_single_hold_rearm"),
+              FinalDefault("physical_protect_keep_watch_verify"));
 }
 
 void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {

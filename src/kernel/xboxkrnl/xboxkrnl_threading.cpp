@@ -46,7 +46,7 @@
 #include <rex/thread/mutex.h>
 
 REXCVAR_DEFINE_BOOL(
-    spinlock_pause_spin, false, "Kernel",
+    spinlock_pause_spin, true, "Kernel",
     "Guest kernel spinlocks (KfAcquireSpinLock, KeAcquireSpinLockAtRaisedIrql, and the kernel's "
     "own APC and reader/writer-lock spinlocks) wait in a CPU pause loop that retries only when "
     "the lock reads free, and yield the thread only after 10 us of waiting. false restores the "

@@ -32,7 +32,7 @@
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
 
-REXCVAR_DEFINE_BOOL(wait_timeout_round_up, false, "Kernel",
+REXCVAR_DEFINE_BOOL(wait_timeout_round_up, true, "Kernel",
                     "Timed waits: round timeouts up to whole ms instead of truncating them, and "
                     "honour absolute timeouts instead of polling");
 

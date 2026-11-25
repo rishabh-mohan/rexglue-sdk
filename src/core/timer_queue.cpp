@@ -26,9 +26,9 @@
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 
-// Default off (behavior changes ship off until rated SAFE). perf-notes/agent11-kernel.md,
+// Default on (final build: WC win3 arm; false = the old phased spin). perf-notes/agent11-kernel.md,
 // "S3 TimerQueue" (task #10), has the measurements and the tests.
-REXCVAR_DEFINE_BOOL(timer_queue_precise_wait, false, "Runtime",
+REXCVAR_DEFINE_BOOL(timer_queue_precise_wait, true, "Runtime",
                     "Host timer thread: sleep until the next timer is due (a condition variable, "
                     "then high-resolution sleeps). Off: the phased spin wait, which keeps a core "
                     "about half busy with the 1 ms KeTimeStampBundle timer")

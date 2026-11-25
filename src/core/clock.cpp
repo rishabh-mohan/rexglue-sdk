@@ -23,7 +23,7 @@ REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
 
-REXCVAR_DEFINE_BOOL(clock_lockfree, false, "Clock",
+REXCVAR_DEFINE_BOOL(clock_lockfree, true, "Clock",
                     "Read the guest clock without taking a lock (applied when the guest clock "
                     "rate is set, at startup)");
 

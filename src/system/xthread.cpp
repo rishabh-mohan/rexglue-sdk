@@ -52,11 +52,11 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
-REXCVAR_DEFINE_BOOL(precise_guest_sleep, false, "Kernel",
+REXCVAR_DEFINE_BOOL(precise_guest_sleep, true, "Kernel",
                     "KeDelayExecutionThread: sleep the exact time (rounded up) on a "
                     "high-resolution timer and honour absolute times");
 
-REXCVAR_DEFINE_BOOL(tls_bounds_fix, false, "Kernel",
+REXCVAR_DEFINE_BOOL(tls_bounds_fix, true, "Kernel",
                     "Thread TLS: allocate whole groups of 4 slots (as the process slot bitmap "
                     "does) and reject slot indices past the end of the slot area");
 

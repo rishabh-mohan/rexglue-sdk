@@ -42,17 +42,17 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
-// S4.7 fix (i), default off: see PhysicalHeap::Protect.
-REXCVAR_DEFINE_BOOL(physical_protect_hold_global_lock, false, "Memory",
+// S4.7 fix (i), default on (final build): see PhysicalHeap::Protect.
+REXCVAR_DEFINE_BOOL(physical_protect_hold_global_lock, true, "Memory",
                     "Hold the global lock across both host protects in PhysicalHeap::Protect")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-// S4 C1 (default off): keep the write watches on physical write protects that change
+// S4 C1 (default on, final build): keep the write watches on physical write protects that change
 // no page's access. Engages only with physical_protect_hold_global_lock on; see
 // PhysicalHeap::ProtectKeepWatch. Both cvars are init-only (C1 v2), so the settings
 // overlay can't turn C1 on mid-run over page state from before fix (i) was on, and
 // Memory::Initialize latches both (C1 v3), so no later set reaches the protect path.
-REXCVAR_DEFINE_BOOL(physical_protect_keep_watch, false, "Memory",
+REXCVAR_DEFINE_BOOL(physical_protect_keep_watch, true, "Memory",
                     "Keep the write watches on physical write protects that leave every "
                     "page's access unchanged (needs physical_protect_hold_global_lock)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);

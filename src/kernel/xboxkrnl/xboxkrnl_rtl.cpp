@@ -48,7 +48,7 @@ REXCVAR_DEFINE_UINT32(
     "with nothing at all in the log.");
 
 REXCVAR_DEFINE_BOOL(
-    cs_spin, false, "Kernel",
+    cs_spin, true, "Kernel",
     "Spin briefly before a contended guest critical section (RtlEnterCriticalSection) blocks in "
     "the kernel: a CPU pause loop that retries the lock only when it reads free, for up to "
     "cs_spin_ns or the guest's own spin count, whichever is longer. false restores the original "
