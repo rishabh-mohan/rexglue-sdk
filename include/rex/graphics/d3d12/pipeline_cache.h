@@ -65,6 +65,17 @@ class PipelineCache {
 
   void EndSubmission();
   bool IsCreatingPipelines();
+  // Creates the queued pipelines on the calling thread, then waits until the
+  // creation threads have finished the ones they took. EndSubmission does this
+  // unless IsCreationNoWait().
+  // Call it only from the thread that drives pipeline creation: the GPU thread,
+  // or the thread acting for it while the command processor is paused. Never
+  // from two threads at once: the completion event has one waiter.
+  void AwaitPipelineCreation();
+  // d3d12_pipeline_creation_no_wait is in effect (latched in Initialize):
+  // EndSubmission doesn't wait for pipelines in creation, so a draw must never
+  // be recorded with a pipeline that isn't created yet.
+  bool IsCreationNoWait() const { return creation_no_wait_; }
 
   // Background shader/pipeline work for the on-screen notice: done / total of
   // the current burst. The counters reset once a burst is finished, so a new
@@ -430,6 +441,8 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+  // d3d12_pipeline_creation_no_wait in effect. Set in Initialize, then only read.
+  bool creation_no_wait_ = false;
 };
 
 }  // namespace rex::graphics::d3d12

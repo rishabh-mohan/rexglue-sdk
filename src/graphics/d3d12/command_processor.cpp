@@ -293,7 +293,8 @@ void ReportSlowFrame() {
       "texture load {:.1f} ({}x) | readback {}x {} KB, {} stalled | "
       "cpu-write invalidations {}x {} KB (on memexport pages {}x {} KB) | "
       "memexport syncs {} ({} KB), on demand {} ({} KB) | "
-      "memexport full-buffer {}x (total {})",
+      "memexport full-buffer {}x (total {}) | "
+      "dropped draws {} | forced pipeline waits {:.1f} ({}x)",
       frame_index, ms(frame_us), ms(s[kCpIdle].us), ms(s[kFenceWait].us), s[kFenceWait].count,
       ms(s[kShaderTranslate].us), s[kShaderTranslate].count, ms(s[kPipelineCreate].us),
       s[kPipelineCreate].count, s[kPipelineMiss].count, ms(s[kTextureLoad].us),
@@ -301,7 +302,8 @@ void ReportSlowFrame() {
       s[kReadbackResolve].us, s[kMemoryInvalidate].count, s[kMemoryInvalidate].extra / 1024,
       s[kMemexportPageInvalidate].count, s[kMemexportPageInvalidate].extra / 1024,
       s[kMemexportFlush].count, s[kMemexportFlush].extra / 1024, s[kMemexportOnDemand].count,
-      s[kMemexportOnDemand].extra / 1024, full_buffer, full_buffer_total);
+      s[kMemexportOnDemand].extra / 1024, full_buffer, full_buffer_total, s[kDroppedDraw].count,
+      ms(s[kPipelineAwait].us), s[kPipelineAwait].count);
 }
 
 uint64_t ParseHashArg(std::string_view args) {
@@ -2754,9 +2756,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
-  if (REXCVAR_GET(async_shader_compilation) &&
+  // Skip the draw while its pipeline is being created (or if creating it
+  // failed). With d3d12_pipeline_creation_no_wait, EndSubmission doesn't wait
+  // for pipelines in creation, so such a draw must never be recorded, even if
+  // async_shader_compilation has been turned off since.
+  if ((REXCVAR_GET(async_shader_compilation) || pipeline_cache_->IsCreationNoWait()) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    bool skip_draw = true;
+    if (pipeline_cache_->IsCreationNoWait() && (memexport_used || active_occlusion_query_.valid)) {
+      // Skipping this draw would lose results the guest reads (exported data,
+      // occlusion sample counts), not just pop in: wait for the pipeline, as
+      // EndSubmission does without the no-wait mode.
+      {
+        frame_stats::Scope await_scope(frame_stats::kPipelineAwait);
+        pipeline_cache_->AwaitPipelineCreation();
+      }
+      skip_draw = pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr;
+    }
+    if (skip_draw) {
+      frame_stats::Add(frame_stats::kDroppedDraw, 0);
+      return true;
+    }
   }
 
   // Update the textures - this may bind pipelines.

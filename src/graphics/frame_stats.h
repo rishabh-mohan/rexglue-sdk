@@ -30,6 +30,8 @@ enum Id : uint32_t {
   kMemexportFlush,     // host-GPU syncs to read memexport results back (bytes in extra)
   kMemexportPageInvalidate,  // of kMemoryInvalidate, the ones on pages memexport wrote
   kMemexportOnDemand,  // exports read back on demand instead of synced (bytes in extra)
+  kDroppedDraw,        // draws skipped: pipeline not created yet, or failed (count only)
+  kPipelineAwait,      // pipeline creation waits forced by unskippable draws (no-wait mode)
   kCount
 };
 

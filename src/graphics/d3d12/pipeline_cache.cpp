@@ -60,6 +60,20 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// With async_shader_compilation, a draw whose pipeline is still being created
+// is skipped, and EndSubmission waits for every pipeline in creation: pop-in
+// lasts one submission, but the wait is a stall. With this on, EndSubmission
+// doesn't wait, and such draws stay skipped until their pipeline is ready
+// (pop-in for a few frames instead). Draws that memexport or run inside an
+// occlusion query still wait (in IssueDraw): skipping them would lose results
+// the guest reads. Read once, in PipelineCache::Initialize.
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_creation_no_wait, false, "GPU/D3D12",
+                    "Don't wait at the end of a submission for pipelines still being created: "
+                    "their draws stay skipped until ready (pop-in for a few frames instead of a "
+                    "stall; memexport and occlusion-query draws still wait). Needs "
+                    "async_shader_compilation, pipeline creation threads and bindless resources")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
@@ -165,6 +179,22 @@ bool PipelineCache::Initialize() {
       creation_thread->set_name("D3D12 Pipelines");
       creation_threads_.push_back(std::move(creation_thread));
     }
+  }
+  // Latched: async_shader_compilation can change at runtime, while the command
+  // processor relies on this staying the same. Bindless only: there a
+  // pipeline's root signature doesn't depend on its pixel shader, so it can't
+  // change while the pipeline is in creation.
+  creation_no_wait_ = REXCVAR_GET(d3d12_pipeline_creation_no_wait) &&
+                      REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                      bindless_resources_used_;
+  if (creation_no_wait_) {
+    REXGPU_INFO(
+        "d3d12_pipeline_creation_no_wait: not waiting for pipeline creation at the end of "
+        "submissions; draws stay skipped until their pipeline is ready");
+  } else if (REXCVAR_GET(d3d12_pipeline_creation_no_wait)) {
+    REXGPU_WARN(
+        "d3d12_pipeline_creation_no_wait ignored: it needs async_shader_compilation, pipeline "
+        "creation threads and bindless resources");
   }
   return true;
 }
@@ -749,6 +779,13 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 }
 
 void PipelineCache::ShutdownShaderStorage() {
+  if (creation_no_wait_) {
+    // In this mode EndSubmission leaves pipelines in creation. Their workers
+    // may still translate shaders and queue them for the storage closed and
+    // cleared below (and InitializeShaderStorage then changes
+    // shader_storage_index_), so let them finish first.
+    AwaitPipelineCreation();
+  }
   if (storage_write_thread_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -792,25 +829,34 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
-  if (!creation_threads_.empty()) {
-    CreateQueuedPipelinesOnProcessorThread();
-    // Await creation of all queued pipelines.
-    bool await_creation_completion_event;
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      // Assuming the creation queue is already empty (because the processor
-      // thread also worked on creating the leftover pipelines), so only check
-      // if there are threads with pipelines currently being created.
-      await_creation_completion_event = creation_threads_busy_ != 0;
-      if (await_creation_completion_event) {
-        creation_completion_event_->Reset();
-        creation_completion_set_event_ = true;
-      }
-    }
+  // With d3d12_pipeline_creation_no_wait, IssueDraw records no draw whose
+  // pipeline isn't created yet, so the submission doesn't need the wait.
+  if (!creation_no_wait_) {
+    AwaitPipelineCreation();
+  }
+}
+
+void PipelineCache::AwaitPipelineCreation() {
+  if (creation_threads_.empty()) {
+    return;
+  }
+  CreateQueuedPipelinesOnProcessorThread();
+  // Await creation of all queued pipelines.
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    // Assuming the creation queue is already empty (because the processor
+    // thread also worked on creating the leftover pipelines), so only check
+    // if there are threads with pipelines currently being created.
+    await_creation_completion_event = creation_threads_busy_ != 0;
     if (await_creation_completion_event) {
-      creation_request_cond_.notify_one();
-      rex::thread::Wait(creation_completion_event_.get(), false);
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
     }
+  }
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    rex::thread::Wait(creation_completion_event_.get(), false);
   }
 }
 
